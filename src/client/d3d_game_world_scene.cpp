@@ -1065,9 +1065,12 @@ struct GameWorldScene::Impl {
     }
 
     std::uint8_t grass_type_at(float world_x, float world_z) {
-        const int map_x = static_cast<int>(std::floor(world_x));
-        const float source_z = config.grassmap_invert_z != 0 ? -world_z : world_z;
-        const int map_z = static_cast<int>(std::floor(source_z));
+        const int map_x = static_cast<int>(std::floor(
+            (config.grassmap_world_offset_x + static_cast<float>(config.grassmap_world_sign_x) * world_x) *
+            config.grassmap_world_scale));
+        const int map_z = static_cast<int>(std::floor(
+            (config.grassmap_world_offset_z + static_cast<float>(config.grassmap_world_sign_z) * world_z) *
+            config.grassmap_world_scale));
         const int world_resolution = config.grassmap_grid_size * config.grassmap_tile_resolution;
         if (map_x < 0 || map_z < 0 || map_x >= world_resolution || map_z >= world_resolution) {
             return 0;
@@ -1104,9 +1107,7 @@ struct GameWorldScene::Impl {
         grass_anchor_z = spawn_z;
         grass_anchor_valid = true;
         grass_center_x = static_cast<int>(std::floor(grass_anchor_x / spacing));
-        const bool invert_z = config.grassmap_invert_z != 0;
-        const float grass_anchor_source_z = invert_z ? -grass_anchor_z : grass_anchor_z;
-        grass_center_z = static_cast<int>(std::floor(grass_anchor_source_z / spacing));
+        grass_center_z = static_cast<int>(std::floor(grass_anchor_z / spacing));
         const float generation_radius = config.grass_radius + config.grass_generation_margin;
         const int cell_radius = static_cast<int>(std::ceil(generation_radius / spacing)) + 1;
         const float cell_selection_radius = generation_radius + spacing;
@@ -1119,9 +1120,9 @@ struct GameWorldScene::Impl {
         for (int cell_x = grass_center_x - cell_radius; cell_x <= grass_center_x + cell_radius; ++cell_x) {
             for (int cell_z = grass_center_z - cell_radius; cell_z <= grass_center_z + cell_radius; ++cell_z) {
                 const float x = static_cast<float>(cell_x) * spacing;
-                const float source_z = static_cast<float>(cell_z) * spacing;
+                const float z = static_cast<float>(cell_z) * spacing;
                 const float dx = x + spacing * 0.5f - grass_anchor_x;
-                const float dz = source_z + spacing * 0.5f - grass_anchor_source_z;
+                const float dz = z + spacing * 0.5f - grass_anchor_z;
                 if (dx * dx + dz * dz <= cell_selection_radius_squared) {
                     target_cells.insert(cell_key(cell_x, cell_z));
                 }
@@ -1142,12 +1143,11 @@ struct GameWorldScene::Impl {
                 }
                 grass_cells.insert(key);
                 const float x = static_cast<float>(cell_x) * spacing;
-                const float source_z = static_cast<float>(cell_z) * spacing;
+                const float z = static_cast<float>(cell_z) * spacing;
                 for (std::size_t sample_index = 0; sample_index < config.grass_sample_offsets.size(); ++sample_index) {
                     const auto& sample_offset = config.grass_sample_offsets[sample_index];
                     const float sample_x = x + sample_offset.x;
-                    const float sample_source_z = source_z + sample_offset.z;
-                    const float sample_z = invert_z ? -sample_source_z : sample_source_z;
+                    const float sample_z = z + sample_offset.z;
                     const auto type = grass_type_at(sample_x, sample_z);
                     if (type == 0 || type >= config.grass_patterns.size()) {
                         continue;
@@ -1205,9 +1205,7 @@ struct GameWorldScene::Impl {
                     for (int detail = 0; detail < detail_count; ++detail) {
                         const float jitter = config.grass_spacing * config.grass_jitter_fraction;
                         const float detail_x = sample_x + (unit_random() * 2.0f - 1.0f) * jitter;
-                        const float detail_source_z =
-                            sample_source_z + (unit_random() * 2.0f - 1.0f) * jitter;
-                        const float detail_z = invert_z ? -detail_source_z : detail_source_z;
+                        const float detail_z = sample_z + (unit_random() * 2.0f - 1.0f) * jitter;
                         float height = 0.0f;
                         Vec3 detail_normal{};
                         if (!terrain_surface_at(detail_x, detail_z, height, detail_normal)) {

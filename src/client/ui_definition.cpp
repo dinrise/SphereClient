@@ -279,6 +279,9 @@ UiWindowDef load_ui_window(const std::filesystem::path& path) {
                     }
                     continue;
                 }
+                if (control.id == 0) {
+                    control.id = -1 - static_cast<int>(window.controls.size());
+                }
                 window.controls.push_back(std::move(control));
                 in_control = false;
                 continue;
@@ -342,6 +345,14 @@ UiWindowDef load_ui_window(const std::filesystem::path& path) {
                 control.image_name = parse_quoted(line);
             } else if (key == L"drawmethod") {
                 control.draw_sprite_name = parse_quoted(line);
+            } else if (key == L"windowhelp") {
+                control.window_help = parse_quoted(line);
+            } else if (key == L"slotempty") {
+                control.slot_empty_image = parse_quoted(line);
+            } else if (key == L"slotfull") {
+                control.slot_full_image = parse_quoted(line);
+            } else if (key == L"slotborder") {
+                control.slot_border_image = parse_quoted(line);
             } else if (key == L"scrollspr") {
                 control.scroll_sprite_name = parse_quoted(line);
                 const auto end_quote = line.find(L'"', line.find(L'"') + 1);
@@ -356,9 +367,8 @@ UiWindowDef load_ui_window(const std::filesystem::path& path) {
                 input >> value;
                 control.password = value == L"true" || value == L"TRUE" || value == L"1";
             } else if (key == L"buttonstyle") {
-                std::wstring value;
-                input >> value;
-                control.send_quit = value == L"SEND_QUIT";
+                control.send_quit = line.find(L"SEND_QUIT") != std::wstring::npos;
+                control.send_help = line.find(L"SEND_HELP") != std::wstring::npos;
             } else if (key == L"hidden") {
                 std::wstring value;
                 input >> value;
@@ -399,10 +409,14 @@ UiWindowDef load_ui_window(const std::filesystem::path& path) {
             window.align_right_y = line.find(L"RIGHT_Y") != std::wstring::npos;
         } else if (!window.name.empty() && key == L"savelastposition") {
             window.save_last_position = parse_bool(input, window.save_last_position);
+        } else if (!window.name.empty() && key == L"candragdrop") {
+            window.can_drag_drop = parse_bool(input, window.can_drag_drop);
         } else if (!window.name.empty() && key == L"cannotcross") {
             window.can_not_cross = parse_bool(input, window.can_not_cross);
         } else if (!window.name.empty() && key == L"cangotop") {
             window.can_go_top = parse_bool(input, window.can_go_top);
+        } else if (!window.name.empty() && key == L"escapehandle") {
+            window.escape_handle = parse_bool(input, window.escape_handle);
         } else if (!window.name.empty() && key == L"drawmethod") {
             window.draw_none = line.find(L"NONE") != std::wstring::npos;
             window.draw_sprite_name = parse_quoted(line);

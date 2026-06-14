@@ -2,9 +2,24 @@ local M = {}
 
 M.ui_windows = {
     "system_left.ui",
+    "system_leftmin.ui",
     "system_right.ui",
+    "system_rightmin.ui",
+    "chat.ui",
     "chat_st2.ui",
     "chat_sys.ui",
+    "inventory.ui",
+    "statinfo.ui",
+    "puppet.ui",
+    "quickitems.ui",
+    "hotkeys.ui",
+    "mantrabook.ui",
+    "journal.ui",
+    "clan.ui",
+    "group.ui",
+    "minimap.ui",
+    "bigmap.ui",
+    "help.ui",
 }
 M.settings_windows = {
     "options.ui",
@@ -13,6 +28,35 @@ M.settings_windows = {
     "controls.ui",
     "intoptions.ui",
     "authors.ui",
+}
+M.ui_initially_visible = {
+    "system_left",
+    "system_right",
+    "chat_st2",
+    "chat_sys",
+}
+M.ui_initially_checked = {
+    {window = "chat_st2", control = 10},
+}
+M.ui_actions = {
+    {window = "system_left", control = 1, action = "toggle_window", target = "statinfo"},
+    {window = "system_left", control = 2, action = "toggle_window", target = "puppet"},
+    {window = "system_left", control = 3, action = "toggle_window", target = "inventory"},
+    {window = "system_left", control = 4, action = "cycle_pair", target = "quick_items", alternate = "hotkeys"},
+    {window = "system_left", control = 6, action = "toggle_window", target = "clan"},
+    {window = "system_left", control = 7, action = "toggle_window", target = "group"},
+    {window = "system_left", control = 8, action = "swap_window", target = "system_leftmin"},
+    {window = "system_leftmin", control = 1, action = "swap_window", target = "system_left"},
+
+    {window = "system_right", control = 1, action = "swap_window", target = "system_rightmin"},
+    {window = "system_right", control = 4, action = "toggle_window", target = "minimap"},
+    {window = "system_right", control = 7, action = "toggle_chat"},
+    {window = "system_right", control = 10, action = "toggle_window", target = "journal_mini"},
+    {window = "system_rightmin", control = 1, action = "swap_window", target = "system_right"},
+
+    {window = "chat_st2", control = 2, action = "toggle_chat"},
+    {window = "chat_st2", control = 4, action = "toggle_chat"},
+    {window = "minimap", control = 5, action = "toggle_window", target = "bigmap"},
 }
 
 -- Recovered from the original landscape lookup/render chain.
@@ -35,8 +79,14 @@ M.static_object_dirs = {
 M.grassmap_dir = "landscape/grassmap"
 M.grassmap_grid_size = 16
 M.grassmap_tile_resolution = 256
--- GrassMap uses source-world coordinates. The D3D scene mirrors source Z.
-M.grassmap_invert_z = 1
+-- Recovered from FUN_00430920:
+-- mapX = floor((4000 + worldX) * 0.512)
+-- mapZ = floor((4000 - worldZ) * 0.512)
+M.grassmap_world_offset_x = 4000.0
+M.grassmap_world_offset_z = 4000.0
+M.grassmap_world_scale = 0.5120000243186951
+M.grassmap_world_sign_x = 1
+M.grassmap_world_sign_z = -1
 -- FUN_00457020 switches to the second 15-pattern bank at this world height.
 M.grass_highland_min_y = 300.0
 M.grass_highland_max_y = 800.0

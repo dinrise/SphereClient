@@ -68,6 +68,10 @@ struct UiControlDef {
     std::wstring focused_image;
     std::wstring image_name;
     std::wstring draw_sprite_name;
+    std::wstring window_help;
+    std::wstring slot_empty_image;
+    std::wstring slot_full_image;
+    std::wstring slot_border_image;
     std::wstring scroll_sprite_name;
     int scroll_sprite_width = 0;
     int scroll_sprite_height = 0;
@@ -76,6 +80,7 @@ struct UiControlDef {
     UiSubButtonDef right_button;
     bool password = false;
     bool send_quit = false;
+    bool send_help = false;
     bool hidden = false;
     bool disabled = false;
     bool text_center = false;
@@ -99,8 +104,10 @@ struct UiWindowDef {
     bool align_right_x = false;
     bool align_right_y = false;
     bool save_last_position = false;
+    bool can_drag_drop = false;
     bool can_not_cross = false;
     bool can_go_top = true;
+    bool escape_handle = false;
     bool draw_none = false;
     std::wstring draw_sprite_name;
     std::vector<UiControlDef> controls;

@@ -47,10 +47,26 @@ struct LuaSkyState {
     int cloud_blue = 0;
 };
 
+struct LuaUiAction {
+    std::wstring window;
+    int control = 0;
+    std::wstring action;
+    std::wstring target;
+    std::wstring alternate;
+};
+
+struct LuaUiControlState {
+    std::wstring window;
+    int control = 0;
+};
+
 struct LuaGameWindowConfig {
     bool ok = false;
     std::vector<std::wstring> ui_windows;
     std::vector<std::wstring> settings_windows;
+    std::vector<std::wstring> ui_initially_visible;
+    std::vector<LuaUiAction> ui_actions;
+    std::vector<LuaUiControlState> ui_initially_checked;
     std::wstring map_file;
     std::vector<std::wstring> landscape_dirs;
     std::vector<std::wstring> model_dirs;
@@ -68,7 +84,11 @@ struct LuaGameWindowConfig {
     float static_object_radius = 0.0f;
     int grassmap_grid_size = 0;
     int grassmap_tile_resolution = 0;
-    int grassmap_invert_z = 0;
+    float grassmap_world_offset_x = 0.0f;
+    float grassmap_world_offset_z = 0.0f;
+    float grassmap_world_scale = 0.0f;
+    int grassmap_world_sign_x = 0;
+    int grassmap_world_sign_z = 0;
     float grass_highland_min_y = 0.0f;
     float grass_highland_max_y = 0.0f;
     int grass_highland_pattern_offset = 0;

@@ -178,44 +178,98 @@ void BitmapFont::draw_text(HDC dc, const std::wstring& text, RECT rect, UINT for
 
     const auto bytes = to_cp1251(text);
     const auto& texture = texture_for_color(color, alpha);
-    int x = rect.left;
-    int y = rect.top;
-    if ((format & DT_VCENTER) != 0) {
-        y += max(0, ((rect.bottom - rect.top) - line_height_) / 2);
+    const int max_width = max(1, rect.right - rect.left);
+    const bool single_line = (format & DT_SINGLELINE) != 0;
+    const bool word_break = !single_line && (format & DT_WORDBREAK) != 0;
+    const auto advance = [&](std::uint8_t ch) {
+        return ch < 32 ? 0 : glyphs_[ch - 32].advance;
+    };
+
+    std::vector<std::vector<std::uint8_t>> lines(1);
+    std::vector<int> widths(1, 0);
+    const auto new_line = [&]() {
+        lines.emplace_back();
+        widths.push_back(0);
+    };
+    const auto append_char = [&](std::uint8_t ch) {
+        if (!single_line && !lines.back().empty() && widths.back() + advance(ch) > max_width) {
+            new_line();
+        }
+        lines.back().push_back(ch);
+        widths.back() += advance(ch);
+    };
+
+    for (std::size_t index = 0; index < bytes.size();) {
+        const auto ch = bytes[index];
+        if (ch == '\r') {
+            ++index;
+            continue;
+        }
+        if (ch == '\n') {
+            if (single_line) {
+                break;
+            }
+            new_line();
+            ++index;
+            continue;
+        }
+        if (word_break && ch == ' ') {
+            if (!lines.back().empty() && widths.back() + advance(ch) <= max_width) {
+                lines.back().push_back(ch);
+                widths.back() += advance(ch);
+            }
+            ++index;
+            continue;
+        }
+        if (!word_break) {
+            append_char(ch);
+            ++index;
+            continue;
+        }
+
+        std::size_t end = index;
+        int word_width = 0;
+        while (end < bytes.size() && bytes[end] != ' ' && bytes[end] != '\r' && bytes[end] != '\n') {
+            word_width += advance(bytes[end]);
+            ++end;
+        }
+        if (!lines.back().empty() && widths.back() + word_width > max_width) {
+            new_line();
+        }
+        while (index < end) {
+            append_char(bytes[index++]);
+        }
     }
-    const int measured = measure_text(text);
-    if ((format & DT_CENTER) != 0) {
-        x = rect.left + max(0, ((rect.right - rect.left) - measured) / 2);
-    } else if ((format & DT_RIGHT) != 0) {
-        x = rect.right - measured;
+    if (lines.size() > 1 && lines.back().empty()) {
+        lines.pop_back();
+        widths.pop_back();
     }
 
-    for (std::uint8_t ch : bytes) {
-        if (ch == '\n') {
-            x = rect.left;
-            y += line_height_ + 2;
-            continue;
+    const int line_step = line_height_ + 2;
+    int y = rect.top;
+    if ((format & DT_VCENTER) != 0) {
+        y += max(0, ((rect.bottom - rect.top) - static_cast<int>(lines.size()) * line_step) / 2);
+    }
+    for (std::size_t line_index = 0; line_index < lines.size() && y <= rect.bottom; ++line_index) {
+        int x = rect.left;
+        if ((format & DT_CENTER) != 0) {
+            x += max(0, (max_width - widths[line_index]) / 2);
+        } else if ((format & DT_RIGHT) != 0) {
+            x = rect.right - widths[line_index];
         }
-        if (ch == '\r') {
-            continue;
+        for (const auto ch : lines[line_index]) {
+            if (ch < 32) {
+                continue;
+            }
+            const auto& glyph = glyphs_[ch - 32];
+            if (glyph.source_w > 0 && glyph.source_h > 0 && ch != 32) {
+                const int dx = x + glyph.x_offset;
+                const int dy = y + (baseline_ - glyph.y_offset);
+                alpha_blit(dc, texture, dx, dy, glyph.source_w, glyph.source_h, glyph.source_x, glyph.source_y, glyph.source_w, glyph.source_h);
+            }
+            x += glyph.advance;
         }
-        if (ch < 32) {
-            continue;
-        }
-        const auto& glyph = glyphs_[ch - 32];
-        if (glyph.source_w > 0 && glyph.source_h > 0 && ch != 32) {
-            const int dx = x + glyph.x_offset;
-            const int dy = y + (baseline_ - glyph.y_offset);
-            alpha_blit(dc, texture, dx, dy, glyph.source_w, glyph.source_h, glyph.source_x, glyph.source_y, glyph.source_w, glyph.source_h);
-        }
-        x += glyph.advance;
-        if ((format & DT_SINGLELINE) == 0 && x > rect.right - line_height_) {
-            x = rect.left;
-            y += line_height_ + 2;
-        }
-        if (y > rect.bottom) {
-            break;
-        }
+        y += line_step;
     }
 }
 

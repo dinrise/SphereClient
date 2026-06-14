@@ -30,6 +30,9 @@ std::wstring lua_game_window_field_error(const char* path) {
     return L"lua\\game_window.lua invalid field: " + widen_ascii(path);
 }
 
+bool read_game_integer_field(lua_State* state, int table_index, const char* field, int min_value, int max_value, int& out, std::wstring& error);
+bool read_game_string_field(lua_State* state, int table_index, const char* field, std::wstring& out, std::wstring& error);
+
 bool read_integer_field(lua_State* state, int table_index, const char* field, int min_value, int max_value, int& out, std::wstring& error) {
     table_index = lua_absindex(state, table_index);
     lua_getfield(state, table_index, field);
@@ -96,6 +99,107 @@ bool read_string_array_field(lua_State* state, int table_index, const char* fiel
         lua_pop(state, 1);
     }
 
+    lua_pop(state, 1);
+    return true;
+}
+
+bool read_optional_game_string_field(
+    lua_State* state,
+    int table_index,
+    const char* field,
+    std::wstring& out,
+    std::wstring& error) {
+    table_index = lua_absindex(state, table_index);
+    lua_getfield(state, table_index, field);
+    if (lua_isnil(state, -1)) {
+        lua_pop(state, 1);
+        out.clear();
+        return true;
+    }
+    const char* value = lua_tostring(state, -1);
+    if (!value || value[0] == '\0') {
+        lua_pop(state, 1);
+        error = lua_game_window_field_error(field);
+        return false;
+    }
+    out = widen_ascii(value);
+    lua_pop(state, 1);
+    return true;
+}
+
+bool read_ui_actions(lua_State* state, int table_index, std::vector<LuaUiAction>& out, std::wstring& error) {
+    table_index = lua_absindex(state, table_index);
+    lua_getfield(state, table_index, "ui_actions");
+    if (!lua_istable(state, -1) || lua_rawlen(state, -1) == 0) {
+        lua_pop(state, 1);
+        error = lua_game_window_field_error("ui_actions");
+        return false;
+    }
+
+    const auto count = static_cast<int>(lua_rawlen(state, -1));
+    out.clear();
+    out.reserve(static_cast<std::size_t>(count));
+    for (int index = 1; index <= count; ++index) {
+        lua_rawgeti(state, -1, index);
+        if (!lua_istable(state, -1)) {
+            lua_pop(state, 2);
+            error = lua_game_window_field_error("ui_actions");
+            return false;
+        }
+
+        LuaUiAction value;
+        const bool ok =
+            read_game_string_field(state, -1, "window", value.window, error) &&
+            read_game_integer_field(state, -1, "control", 0, 65535, value.control, error) &&
+            read_game_string_field(state, -1, "action", value.action, error) &&
+            read_optional_game_string_field(state, -1, "target", value.target, error) &&
+            read_optional_game_string_field(state, -1, "alternate", value.alternate, error);
+        lua_pop(state, 1);
+        if (!ok) {
+            lua_pop(state, 1);
+            return false;
+        }
+        out.push_back(std::move(value));
+    }
+    lua_pop(state, 1);
+    return true;
+}
+
+bool read_ui_control_states(
+    lua_State* state,
+    int table_index,
+    const char* field,
+    std::vector<LuaUiControlState>& out,
+    std::wstring& error) {
+    table_index = lua_absindex(state, table_index);
+    lua_getfield(state, table_index, field);
+    if (!lua_istable(state, -1)) {
+        lua_pop(state, 1);
+        error = lua_game_window_field_error(field);
+        return false;
+    }
+
+    const auto count = static_cast<int>(lua_rawlen(state, -1));
+    out.clear();
+    out.reserve(static_cast<std::size_t>(count));
+    for (int index = 1; index <= count; ++index) {
+        lua_rawgeti(state, -1, index);
+        if (!lua_istable(state, -1)) {
+            lua_pop(state, 2);
+            error = lua_game_window_field_error(field);
+            return false;
+        }
+        LuaUiControlState value;
+        const bool ok =
+            read_game_string_field(state, -1, "window", value.window, error) &&
+            read_game_integer_field(state, -1, "control", 0, 65535, value.control, error);
+        lua_pop(state, 1);
+        if (!ok) {
+            lua_pop(state, 1);
+            return false;
+        }
+        out.push_back(std::move(value));
+    }
     lua_pop(state, 1);
     return true;
 }
@@ -381,6 +485,9 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
     const bool ok =
         read_string_array_field(state, config_index, "ui_windows", out.ui_windows, error) &&
         read_string_array_field(state, config_index, "settings_windows", out.settings_windows, error) &&
+        read_string_array_field(state, config_index, "ui_initially_visible", out.ui_initially_visible, error) &&
+        read_ui_actions(state, config_index, out.ui_actions, error) &&
+        read_ui_control_states(state, config_index, "ui_initially_checked", out.ui_initially_checked, error) &&
         read_game_string_field(state, config_index, "map_file", out.map_file, error) &&
         read_string_array_field(state, config_index, "landscape_dirs", out.landscape_dirs, error) &&
         read_string_array_field(state, config_index, "model_dirs", out.model_dirs, error) &&
@@ -398,7 +505,11 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "static_object_radius", 1.0, 10000.0, out.static_object_radius, error) &&
         read_game_integer_field(state, config_index, "grassmap_grid_size", 1, 256, out.grassmap_grid_size, error) &&
         read_game_integer_field(state, config_index, "grassmap_tile_resolution", 1, 4096, out.grassmap_tile_resolution, error) &&
-        read_game_integer_field(state, config_index, "grassmap_invert_z", 0, 1, out.grassmap_invert_z, error) &&
+        read_game_number_field(state, config_index, "grassmap_world_offset_x", -100000.0, 100000.0, out.grassmap_world_offset_x, error) &&
+        read_game_number_field(state, config_index, "grassmap_world_offset_z", -100000.0, 100000.0, out.grassmap_world_offset_z, error) &&
+        read_game_number_field(state, config_index, "grassmap_world_scale", 0.000001, 1000.0, out.grassmap_world_scale, error) &&
+        read_game_integer_field(state, config_index, "grassmap_world_sign_x", -1, 1, out.grassmap_world_sign_x, error) &&
+        read_game_integer_field(state, config_index, "grassmap_world_sign_z", -1, 1, out.grassmap_world_sign_z, error) &&
         read_game_number_field(state, config_index, "grass_highland_min_y", -10000.0, 10000.0, out.grass_highland_min_y, error) &&
         read_game_number_field(state, config_index, "grass_highland_max_y", -10000.0, 10000.0, out.grass_highland_max_y, error) &&
         read_game_integer_field(state, config_index, "grass_highland_pattern_offset", 0, 30, out.grass_highland_pattern_offset, error) &&

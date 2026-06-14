@@ -143,6 +143,8 @@ struct AppState {
     sphere::client::UiWindowDef pick_person_window;
     std::vector<sphere::client::UiWindowDef> game_windows;
     std::vector<bool> game_window_visible;
+    std::vector<int> game_window_z_order;
+    std::unordered_map<std::uint64_t, bool> game_control_checked;
     int settings_window_start_index = -1;
     sphere::client::BitmapImage background;
     std::unordered_map<std::wstring, sphere::client::BitmapImage> textures;
@@ -166,6 +168,11 @@ struct AppState {
     int game_pressed_control_id = 0;
     int game_hot_window_index = -1;
     int game_pressed_window_index = -1;
+    int game_active_edit_window_index = -1;
+    int game_active_edit_control_id = 0;
+    std::wstring game_edit_text;
+    std::vector<std::wstring> game_chat_lines;
+    std::wstring game_help_text;
     POINT game_pressed_mouse{};
     std::optional<ClientSettings> settings_dialog_backup;
     UiDragKind ui_drag_kind = UiDragKind::None;
@@ -852,7 +859,7 @@ std::wstring resolve_text(const sphere::client::UiControlDef& def) {
         return {};
     }
     const auto& value = sphere::client::lookup_ui_string(g_app->runtime.strings, def.text_key);
-    return value.empty() ? def.text_key : value;
+    return value.empty() && lowercase(def.text_key).starts_with(L"uistr_") ? L"" : (value.empty() ? def.text_key : value);
 }
 
 std::wstring ui_string(const wchar_t* key) {
@@ -1333,11 +1340,15 @@ void draw_control(HDC dc, const sphere::client::UiControlDef& def) {
 }
 
 std::wstring window_text(const sphere::client::UiWindowDef& window) {
+    const auto name = lowercase(window.name);
+    if ((name == L"puppet" || name == L"statinfo") && !g_app->game_world.character_name.empty()) {
+        return g_app->game_world.character_name;
+    }
     if (window.text_key.empty()) {
         return {};
     }
     const auto& value = sphere::client::lookup_ui_string(g_app->runtime.strings, window.text_key);
-    return value.empty() ? window.text_key : value;
+    return value.empty() && lowercase(window.text_key).starts_with(L"uistr_") ? L"" : (value.empty() ? window.text_key : value);
 }
 
 RECT ui_window_rect(HWND hwnd, const sphere::client::UiWindowDef& window) {
@@ -1483,12 +1494,73 @@ void draw_game_progress(HDC dc, const sphere::client::UiControlDef& def, RECT rc
     }
 }
 
-void draw_game_textlist(HDC dc, const sphere::client::UiControlDef& def, RECT rc) {
-    const int line_height = max(14, def.height / 2);
-    RECT first{rc.left, rc.top, rc.right, min(rc.bottom, rc.top + line_height)};
-    RECT second{rc.left, first.bottom, rc.right, rc.bottom};
-    draw_ui_text(dc, format_game_spawn_line(), first, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, sphere::client::UiColor{170, 170, 170, 255});
-    draw_ui_text(dc, format_game_packet_line(), second, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, sphere::client::UiColor{135, 135, 135, 255});
+void draw_game_textlist(
+    HDC dc,
+    const sphere::client::UiWindowDef& window,
+    const sphere::client::UiControlDef& def,
+    RECT rc) {
+    const auto name = lowercase(window.name);
+    if (name == L"chat_sys") {
+        const int line_height = max(14, def.height / 2);
+        RECT first{rc.left, rc.top, rc.right, min(rc.bottom, rc.top + line_height)};
+        RECT second{rc.left, first.bottom, rc.right, rc.bottom};
+        draw_ui_text(dc, format_game_spawn_line(), first, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, sphere::client::UiColor{170, 170, 170, 255});
+        draw_ui_text(dc, format_game_packet_line(), second, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, sphere::client::UiColor{135, 135, 135, 255});
+        return;
+    }
+    if (name != L"chat" && name != L"chat_st2") {
+        return;
+    }
+
+    const int line_height = 14;
+    const int visible_lines = (std::max)(1, static_cast<int>(rc.bottom - rc.top) / line_height);
+    const int first_line = (std::max)(0, static_cast<int>(g_app->game_chat_lines.size()) - visible_lines);
+    int y = rc.top;
+    for (int index = first_line; index < static_cast<int>(g_app->game_chat_lines.size()) && y < rc.bottom; ++index) {
+        RECT line{rc.left, y, rc.right, (std::min)(rc.bottom, static_cast<LONG>(y + line_height))};
+        draw_ui_text(dc, g_app->game_chat_lines[static_cast<std::size_t>(index)], line, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, def.text_color);
+        y += line_height;
+    }
+}
+
+std::wstring plain_hypertext(const std::wstring& source) {
+    std::wstring without_tags;
+    without_tags.reserve(source.size());
+    for (std::size_t index = 0; index < source.size();) {
+        if (source[index] != L'<') {
+            without_tags.push_back(source[index++]);
+            continue;
+        }
+        const auto end = source.find(L'>', index + 1);
+        if (end == std::wstring::npos) {
+            break;
+        }
+        const auto tag = lowercase(source.substr(index + 1, end - index - 1));
+        if (tag == L"br") {
+            without_tags.push_back(L'\n');
+        } else if (tag == L"tab") {
+            without_tags.append(4, L' ');
+        }
+        index = end + 1;
+    }
+
+    std::wstring result;
+    std::wistringstream lines(without_tags);
+    std::wstring line;
+    while (std::getline(lines, line)) {
+        const auto first = line.find_first_not_of(L" \t\r");
+        const auto last = line.find_last_not_of(L" \t\r");
+        const auto trimmed = first == std::wstring::npos ? std::wstring{} : line.substr(first, last - first + 1);
+        if (trimmed.empty() || trimmed == L"hypertext" || trimmed == L"{" || trimmed == L"}" ||
+            trimmed.starts_with(L"//")) {
+            continue;
+        }
+        if (!result.empty()) {
+            result.push_back(L'\n');
+        }
+        result += line;
+    }
+    return result;
 }
 
 std::wstring enabled_text(bool enabled) {
@@ -1554,6 +1626,16 @@ RECT game_control_rect(RECT window_rect, const sphere::client::UiControlDef& def
     return rc;
 }
 
+std::uint64_t game_control_state_key(int window_index, int control_id) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(window_index)) << 32) |
+        static_cast<std::uint32_t>(control_id);
+}
+
+bool game_control_is_checked(int window_index, int control_id) {
+    const auto found = g_app->game_control_checked.find(game_control_state_key(window_index, control_id));
+    return found != g_app->game_control_checked.end() && found->second;
+}
+
 RECT scroll_sub_button_rect(
     RECT control_rect,
     const sphere::client::UiSubButtonDef& button) {
@@ -1594,6 +1676,21 @@ void draw_game_control(HDC dc, const sphere::client::UiWindowDef& window, int wi
     if (class_is(def, L"Image")) {
         if (!def.image_name.empty()) {
             draw_sprite_from_window(dc, window, def.image_name, rc.left, rc.top);
+        }
+        return;
+    }
+    if (class_is(def, L"Slot")) {
+        return;
+    }
+    if (class_is(def, L"CheckBox")) {
+        const bool pressed = g_app->game_pressed_window_index == window_index && g_app->game_pressed_control_id == def.id;
+        const bool hot = g_app->game_hot_window_index == window_index && g_app->game_hot_control_id == def.id;
+        const bool checked = game_control_is_checked(window_index, def.id);
+        const auto& sprite = checked || pressed
+            ? def.checked_image
+            : (hot && !def.focused_image.empty() ? def.focused_image : def.unchecked_image);
+        if (!sprite.empty()) {
+            draw_sprite_from_window(dc, window, sprite, rc.left, rc.top);
         }
         return;
     }
@@ -1668,8 +1765,23 @@ void draw_game_control(HDC dc, const sphere::client::UiWindowDef& window, int wi
         draw_game_progress(dc, def, rc);
         return;
     }
-    if (class_is(def, L"TextList")) {
-        draw_game_textlist(dc, def, rc);
+    if (class_is(def, L"TextList") || class_is(def, L"HTCHATLISTCTRL")) {
+        draw_game_textlist(dc, window, def, rc);
+        return;
+    }
+    if (class_is(def, L"Edit") || class_is(def, L"HTEDIT")) {
+        std::wstring text;
+        if (g_app->game_active_edit_window_index == window_index && g_app->game_active_edit_control_id == def.id) {
+            text = g_app->game_edit_text + L"_";
+        }
+        const UINT align = def.text_center ? DT_CENTER : DT_LEFT;
+        draw_ui_text(dc, text, rc, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, def.font_index, def.disabled ? def.disabled_color : def.text_color);
+        return;
+    }
+    if (class_is(def, L"HYPER_TEXT")) {
+        if (lowercase(window.name) == L"help" && !g_app->game_help_text.empty()) {
+            draw_ui_text(dc, g_app->game_help_text, rc, DT_LEFT | DT_TOP | DT_WORDBREAK, def.font_index, def.text_color);
+        }
         return;
     }
     if (class_is(def, L"Text")) {
@@ -1703,7 +1815,8 @@ void draw_game_window(HDC dc, HWND hwnd, const sphere::client::UiWindowDef& wind
 }
 
 std::pair<int, int> game_hit_test(HWND hwnd, POINT pt) {
-    for (int i = static_cast<int>(g_app->game_windows.size()) - 1; i >= 0; --i) {
+    for (auto order = g_app->game_window_z_order.rbegin(); order != g_app->game_window_z_order.rend(); ++order) {
+        const int i = *order;
         if (i < static_cast<int>(g_app->game_window_visible.size()) &&
             !g_app->game_window_visible[static_cast<std::size_t>(i)]) {
             continue;
@@ -1716,7 +1829,9 @@ std::pair<int, int> game_hit_test(HWND hwnd, POINT pt) {
         for (const auto& control : window.controls) {
             if (control.hidden || control.disabled ||
                 (!class_is(control, L"Button") && !class_is(control, L"SpinButton") &&
-                 !class_is(control, L"Scroll_Bar") && !class_is(control, L"SCROLL_BAR"))) {
+                 !class_is(control, L"Scroll_Bar") && !class_is(control, L"SCROLL_BAR") &&
+                 !class_is(control, L"CheckBox") && !class_is(control, L"Edit") &&
+                 !class_is(control, L"HTEDIT"))) {
                 continue;
             }
             const RECT rc = game_control_rect(window_rect, control);
@@ -1744,6 +1859,109 @@ int game_window_index_by_name(const std::wstring& name) {
     return -1;
 }
 
+void bring_game_window_to_front(int index) {
+    if (index < 0 || index >= static_cast<int>(g_app->game_windows.size()) ||
+        !g_app->game_windows[static_cast<std::size_t>(index)].can_go_top) {
+        return;
+    }
+    auto found = std::find(g_app->game_window_z_order.begin(), g_app->game_window_z_order.end(), index);
+    if (found == g_app->game_window_z_order.end() || std::next(found) == g_app->game_window_z_order.end()) {
+        return;
+    }
+    g_app->game_window_z_order.erase(found);
+    g_app->game_window_z_order.push_back(index);
+}
+
+void set_game_window_visible(const std::wstring& name, bool visible) {
+    const int index = game_window_index_by_name(name);
+    if (index < 0 || index >= static_cast<int>(g_app->game_window_visible.size())) {
+        return;
+    }
+    g_app->game_window_visible[static_cast<std::size_t>(index)] = visible;
+    if (visible) {
+        bring_game_window_to_front(index);
+    } else if (g_app->game_active_edit_window_index == index) {
+        g_app->game_active_edit_window_index = -1;
+        g_app->game_active_edit_control_id = 0;
+        g_app->game_edit_text.clear();
+    }
+}
+
+void toggle_game_window(const std::wstring& name) {
+    const int index = game_window_index_by_name(name);
+    if (index < 0 || index >= static_cast<int>(g_app->game_window_visible.size())) {
+        return;
+    }
+    set_game_window_visible(name, !g_app->game_window_visible[static_cast<std::size_t>(index)]);
+}
+
+void toggle_game_chat() {
+    const int compact = game_window_index_by_name(L"chat");
+    const int expanded = game_window_index_by_name(L"chat_st2");
+    if (compact < 0 || expanded < 0) {
+        return;
+    }
+    const bool expanded_visible = g_app->game_window_visible[static_cast<std::size_t>(expanded)];
+    set_game_window_visible(L"chat_st2", !expanded_visible);
+    set_game_window_visible(L"chat", expanded_visible);
+}
+
+bool execute_lua_ui_action(int window_index, int control_id) {
+    const auto window_name = lowercase(g_app->game_windows[static_cast<std::size_t>(window_index)].name);
+    const auto found = std::find_if(
+        g_app->lua_boot.game_window.ui_actions.begin(),
+        g_app->lua_boot.game_window.ui_actions.end(),
+        [&](const sphere::client::LuaUiAction& action) {
+            return lowercase(action.window) == window_name && action.control == control_id;
+        });
+    if (found == g_app->lua_boot.game_window.ui_actions.end()) {
+        return false;
+    }
+
+    const auto action = lowercase(found->action);
+    if (action == L"toggle_window") {
+        toggle_game_window(found->target);
+    } else if (action == L"show_window") {
+        set_game_window_visible(found->target, true);
+    } else if (action == L"hide_window") {
+        set_game_window_visible(found->target, false);
+    } else if (action == L"swap_window") {
+        set_game_window_visible(g_app->game_windows[static_cast<std::size_t>(window_index)].name, false);
+        set_game_window_visible(found->target, true);
+    } else if (action == L"toggle_chat") {
+        toggle_game_chat();
+    } else if (action == L"cycle_pair") {
+        const int first = game_window_index_by_name(found->target);
+        const int second = game_window_index_by_name(found->alternate);
+        if (first >= 0 && second >= 0) {
+            const bool first_visible = g_app->game_window_visible[static_cast<std::size_t>(first)];
+            const bool second_visible = g_app->game_window_visible[static_cast<std::size_t>(second)];
+            set_game_window_visible(found->target, !first_visible && !second_visible);
+            set_game_window_visible(found->alternate, first_visible);
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool close_topmost_game_window() {
+    for (auto order = g_app->game_window_z_order.rbegin(); order != g_app->game_window_z_order.rend(); ++order) {
+        const int index = *order;
+        if (index < 0 || index >= static_cast<int>(g_app->game_window_visible.size()) ||
+            !g_app->game_window_visible[static_cast<std::size_t>(index)]) {
+            continue;
+        }
+        const auto& window = g_app->game_windows[static_cast<std::size_t>(index)];
+        if (!window.escape_handle || index >= g_app->settings_window_start_index) {
+            continue;
+        }
+        set_game_window_visible(window.name, false);
+        return true;
+    }
+    return false;
+}
+
 void hide_settings_windows() {
     if (g_app->settings_window_start_index < 0) {
         return;
@@ -1758,6 +1976,7 @@ void show_settings_window(const std::wstring& name) {
     const int index = game_window_index_by_name(name);
     if (index >= g_app->settings_window_start_index && index < static_cast<int>(g_app->game_window_visible.size())) {
         g_app->game_window_visible[static_cast<std::size_t>(index)] = true;
+        bring_game_window_to_front(index);
     }
 }
 
@@ -1833,6 +2052,11 @@ void activate_game_control(HWND hwnd, int window_index, int control_id, POINT pt
         return value.id == control_id;
     });
     if (control == window.controls.end()) {
+        return;
+    }
+
+    if (execute_lua_ui_action(window_index, control_id)) {
+        update_game_overlay(hwnd);
         return;
     }
 
@@ -1953,6 +2177,25 @@ void activate_game_control(HWND hwnd, int window_index, int control_id, POINT pt
                     : std::clamp(g_app->settings.sound_volume + direction * control->delta_step, 0, 100);
             }
         }
+    } else if (class_is(*control, L"CheckBox")) {
+        const auto key = game_control_state_key(window_index, control_id);
+        g_app->game_control_checked[key] = !game_control_is_checked(window_index, control_id);
+    } else if (class_is(*control, L"Edit") || class_is(*control, L"HTEDIT")) {
+        g_app->game_active_edit_window_index = window_index;
+        g_app->game_active_edit_control_id = control_id;
+        g_app->game_edit_text.clear();
+    } else if (control->send_help) {
+        if (!control->window_help.empty()) {
+            const auto path = g_app->settings.root / control->window_help;
+            if (!std::filesystem::exists(path)) {
+                g_app->status = L"Help file is missing: " + path.wstring();
+            } else {
+                g_app->game_help_text = plain_hypertext(sphere::client::decode_cp1251_file(path));
+                set_game_window_visible(L"help", true);
+            }
+        }
+    } else if (control->send_quit) {
+        set_game_window_visible(window.name, false);
     }
     update_game_overlay(hwnd);
 }
@@ -2413,8 +2656,8 @@ bool update_game_overlay(HWND hwnd) {
     if (g_app->ui_font) {
         old_font = SelectObject(dc, g_app->ui_font);
     }
-    for (std::size_t i = 0; i < g_app->game_windows.size(); ++i) {
-        draw_game_window(dc, hwnd, g_app->game_windows[i], static_cast<int>(i));
+    for (const int index : g_app->game_window_z_order) {
+        draw_game_window(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
     }
     if (old_font) {
         SelectObject(dc, old_font);
@@ -2629,8 +2872,8 @@ void paint_game_scene(HWND hwnd, HDC dc) {
     FillRect(dc, &rc, black);
     DeleteObject(black);
 
-    for (std::size_t i = 0; i < g_app->game_windows.size(); ++i) {
-        draw_game_window(dc, hwnd, g_app->game_windows[i], static_cast<int>(i));
+    for (const int index : g_app->game_window_z_order) {
+        draw_game_window(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
     }
 }
 
@@ -3474,15 +3717,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g_app->game_pressed_control_id = pressed_control;
             g_app->game_pressed_mouse = pt;
             if (pressed_control != 0) {
+                bring_game_window_to_front(pressed_window);
                 SetCapture(hwnd);
             } else {
-                for (int index = static_cast<int>(g_app->game_windows.size()) - 1; index >= 0; --index) {
+                for (auto order = g_app->game_window_z_order.rbegin(); order != g_app->game_window_z_order.rend(); ++order) {
+                    const int index = *order;
                     if (index < static_cast<int>(g_app->game_window_visible.size()) &&
                         !g_app->game_window_visible[static_cast<std::size_t>(index)]) {
                         continue;
                     }
                     auto& window = g_app->game_windows[static_cast<std::size_t>(index)];
-                    if (ui_window_title_hit(hwnd, window, pt)) {
+                    const RECT window_rect = ui_window_rect(hwnd, window);
+                    if (ui_window_title_hit(hwnd, window, pt) ||
+                        (window.can_drag_drop && PtInRect(&window_rect, pt))) {
+                        bring_game_window_to_front(index);
                         begin_ui_drag(hwnd, window, UiDragKind::Game, index, pt);
                         break;
                     }
@@ -3573,6 +3821,29 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (g_app->mode == AppMode::Game) {
+            if (g_app->game_active_edit_window_index >= 0) {
+                if (wparam == VK_ESCAPE) {
+                    g_app->game_active_edit_window_index = -1;
+                    g_app->game_active_edit_control_id = 0;
+                    g_app->game_edit_text.clear();
+                } else if (wparam == VK_BACK) {
+                    if (!g_app->game_edit_text.empty()) {
+                        g_app->game_edit_text.pop_back();
+                    }
+                } else if (wparam == VK_RETURN) {
+                    const auto& edit_window = g_app->game_windows[static_cast<std::size_t>(g_app->game_active_edit_window_index)];
+                    if (lowercase(edit_window.name) == L"chat_st2" && !g_app->game_edit_text.empty()) {
+                        const auto author = g_app->game_world.character_name.empty() ? L"Player" : g_app->game_world.character_name;
+                        g_app->game_chat_lines.push_back(author + L": " + g_app->game_edit_text);
+                        if (g_app->game_chat_lines.size() > 256) {
+                            g_app->game_chat_lines.erase(g_app->game_chat_lines.begin());
+                        }
+                        g_app->game_edit_text.clear();
+                    }
+                }
+                update_game_overlay(hwnd);
+                return 0;
+            }
             if (set_game_movement_key(wparam, lparam, true)) {
                 return 0;
             }
@@ -3583,7 +3854,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             } else if (wparam == VK_ESCAPE && g_app->game_look_mode) {
                 set_game_look_mode(hwnd, false);
             } else if (wparam == VK_ESCAPE) {
-                toggle_game_options(hwnd);
+                if (!close_topmost_game_window()) {
+                    toggle_game_options(hwnd);
+                } else {
+                    update_game_overlay(hwnd);
+                }
             }
             return 0;
         }
@@ -3624,6 +3899,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             if (wparam >= 32) {
                 append_character_name_char(static_cast<wchar_t>(wparam));
                 update_character_select_overlay(hwnd);
+            }
+            return 0;
+        }
+        if (g_app->mode == AppMode::Game) {
+            if (g_app->game_active_edit_window_index >= 0 && wparam >= 32 && g_app->game_edit_text.size() < 256) {
+                g_app->game_edit_text.push_back(static_cast<wchar_t>(wparam));
+                update_game_overlay(hwnd);
             }
             return 0;
         }
@@ -3735,9 +4017,69 @@ int run(HINSTANCE instance, int show_command) {
             state->game_windows.end(),
             std::make_move_iterator(settings_windows.begin()),
             std::make_move_iterator(settings_windows.end()));
-        state->game_window_visible.assign(state->game_windows.size(), true);
-        for (int index = state->settings_window_start_index; index < static_cast<int>(state->game_window_visible.size()); ++index) {
-            state->game_window_visible[static_cast<std::size_t>(index)] = false;
+        state->game_window_visible.assign(state->game_windows.size(), false);
+        state->game_window_z_order.reserve(state->game_windows.size());
+        for (int index = 0; index < static_cast<int>(state->game_windows.size()); ++index) {
+            state->game_window_z_order.push_back(index);
+        }
+        const auto window_index = [&](const std::wstring& name) {
+            const auto expected = lowercase(name);
+            for (std::size_t index = 0; index < state->game_windows.size(); ++index) {
+                if (lowercase(state->game_windows[index].name) == expected) {
+                    return static_cast<int>(index);
+                }
+            }
+            return -1;
+        };
+        for (const auto& name : state->lua_boot.game_window.ui_initially_visible) {
+            const int index = window_index(name);
+            if (index < 0 || index >= state->settings_window_start_index) {
+                throw std::runtime_error("Lua initial UI window is not loaded");
+            }
+            state->game_window_visible[static_cast<std::size_t>(index)] = true;
+        }
+        for (const auto& action : state->lua_boot.game_window.ui_actions) {
+            const int source = window_index(action.window);
+            if (source < 0 || source >= state->settings_window_start_index) {
+                throw std::runtime_error("Lua UI action source window is not loaded");
+            }
+            const auto& controls = state->game_windows[static_cast<std::size_t>(source)].controls;
+            if (std::none_of(controls.begin(), controls.end(), [&](const auto& value) {
+                    return value.id == action.control;
+                })) {
+                throw std::runtime_error("Lua UI action source control is not loaded");
+            }
+            const auto kind = lowercase(action.action);
+            const bool needs_target =
+                kind == L"toggle_window" || kind == L"show_window" ||
+                kind == L"hide_window" || kind == L"swap_window" ||
+                kind == L"cycle_pair";
+            if (needs_target && window_index(action.target) < 0) {
+                throw std::runtime_error("Lua UI action target window is not loaded");
+            }
+            if (kind == L"cycle_pair" && window_index(action.alternate) < 0) {
+                throw std::runtime_error("Lua UI action alternate window is not loaded");
+            }
+            if (!needs_target && kind != L"toggle_chat") {
+                throw std::runtime_error("Lua UI action type is not supported");
+            }
+        }
+        for (const auto& checked : state->lua_boot.game_window.ui_initially_checked) {
+            const int index = window_index(checked.window);
+            if (index < 0) {
+                throw std::runtime_error("Lua checked UI control window is not loaded");
+            }
+            const auto& controls = state->game_windows[static_cast<std::size_t>(index)].controls;
+            const auto control = std::find_if(controls.begin(), controls.end(), [&](const auto& value) {
+                return value.id == checked.control;
+            });
+            if (control == controls.end()) {
+                throw std::runtime_error("Lua checked UI control is not loaded");
+            }
+            const auto key =
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(index)) << 32) |
+                static_cast<std::uint32_t>(checked.control);
+            state->game_control_checked[key] = true;
         }
     }
     apply_login_script_bootstrap(state->runtime.connection_window);
