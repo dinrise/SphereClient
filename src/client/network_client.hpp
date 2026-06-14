@@ -77,10 +77,13 @@ public:
     CharacterActionResult create_character(int slot, const std::wstring& name, const CharacterCreationAppearance& appearance, int timeout_ms = 2500);
     CharacterActionResult delete_character(int slot, int timeout_ms = 2500);
     CharacterActionResult send_ingame_ack(int timeout_ms = 2500);
+    CharacterActionResult poll_frames(int max_frames = 32);
     bool send_position(double x, double y, double z, double angle, std::string& error);
 
     bool connected() const;
     std::uint16_t local_id() const;
+    bool has_game_time() const;
+    float game_time_fraction() const;
 
 private:
     struct Impl;
@@ -107,6 +110,8 @@ struct LoginProbeResult {
     int next_length = 0;
     bool character_select_ready = false;
     std::uint16_t local_id = 0;
+    bool has_game_time = false;
+    float game_time_fraction = 0.0f;
     int character_select_packets = 0;
     int character_select_bytes = 0;
     std::shared_ptr<ServerSession> session;

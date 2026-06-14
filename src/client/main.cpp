@@ -192,6 +192,8 @@ struct AppState {
     ULONGLONG game_last_tick = 0;
     ULONGLONG game_last_position_send_tick = 0;
     ULONGLONG game_last_overlay_tick = 0;
+    bool has_game_time = false;
+    float game_time_fraction = 0.0f;
     GameWorldState game_world;
     std::wstring status;
 };
@@ -1513,8 +1515,11 @@ std::wstring game_control_text(const sphere::client::UiWindowDef& window, const 
         }
         case 9:
             return quality_text(g_app->settings.shadow_quality, true);
-        case 10:
-            return quality_text(g_app->settings.grass_quality, false);
+        case 10: {
+            const auto& labels = g_app->lua_boot.game_window.grass_mode_text;
+            const auto mode = static_cast<std::size_t>(std::clamp(g_app->settings.grass_quality, 0, 2));
+            return mode < labels.size() ? labels[mode] : L"";
+        }
         case 22:
             return quality_text(g_app->settings.reflection_quality, false);
         case 31:
@@ -2546,6 +2551,11 @@ void update_game_frame(HWND hwnd) {
         }
         g_app->game_last_position_send_tick = now;
     }
+    if (g_app->server_session) {
+        auto incoming = g_app->server_session->poll_frames();
+        g_app->game_world.world_packet_count += incoming.packet_count;
+        g_app->game_world.world_byte_count += incoming.byte_count;
+    }
     if (changed && now - g_app->game_last_overlay_tick >= 200) {
         update_game_overlay(hwnd);
         g_app->game_last_overlay_tick = now;
@@ -2737,6 +2747,8 @@ void enter_character_select_3d(HWND hwnd, const sphere::client::LoginProbeResult
     g_app->character_action_in_progress = false;
     g_app->character_entered_game = false;
     g_app->server_session = result.session;
+    g_app->has_game_time = result.has_game_time;
+    g_app->game_time_fraction = result.game_time_fraction;
     g_app->character_slots = result.character_slots;
     g_app->selected_character_slot = first_selectable_character_slot(g_app->character_slots);
     for (int i = 0; i < 3; ++i) {
@@ -3037,6 +3049,9 @@ bool enter_game_mode(HWND hwnd, const PostedCharacterActionResult& posted) {
         append_client_log(L"enter_game_mode: Game world init failed: " + error);
         set_status(hwnd, L"Game world init failed: " + error);
         return false;
+    }
+    if (g_app->has_game_time) {
+        scene->set_game_time(g_app->game_time_fraction);
     }
 
     g_app->game_world = std::move(world);

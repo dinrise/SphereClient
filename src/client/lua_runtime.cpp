@@ -100,7 +100,7 @@ bool read_string_array_field(lua_State* state, int table_index, const char* fiel
     return true;
 }
 
-bool read_grass_patterns(lua_State* state, int table_index, std::array<std::vector<std::wstring>, 16>& out, std::wstring& error) {
+bool read_grass_patterns(lua_State* state, int table_index, std::array<std::vector<std::wstring>, 31>& out, std::wstring& error) {
     table_index = lua_absindex(state, table_index);
     lua_getfield(state, table_index, "grass_patterns");
     if (!lua_istable(state, -1)) {
@@ -203,6 +203,55 @@ bool read_grass_sample_offsets(
         }
         out.push_back(offset);
         lua_pop(state, 1);
+    }
+    lua_pop(state, 1);
+    return true;
+}
+
+bool read_sky_states(lua_State* state, int table_index, std::vector<LuaSkyState>& out, std::wstring& error) {
+    table_index = lua_absindex(state, table_index);
+    lua_getfield(state, table_index, "sky_states");
+    if (!lua_istable(state, -1) || lua_rawlen(state, -1) < 2) {
+        lua_pop(state, 1);
+        error = lua_game_window_field_error("sky_states");
+        return false;
+    }
+    const auto count = static_cast<int>(lua_rawlen(state, -1));
+    out.clear();
+    out.reserve(static_cast<std::size_t>(count));
+    float previous_time = -1.0f;
+    for (int index = 1; index <= count; ++index) {
+        lua_rawgeti(state, -1, index);
+        if (!lua_istable(state, -1)) {
+            lua_pop(state, 2);
+            error = lua_game_window_field_error("sky_states");
+            return false;
+        }
+        LuaSkyState value;
+        const bool ok =
+            read_game_number_field(state, -1, "time", 0.0, 0.999999, value.time, error) &&
+            read_game_integer_field(state, -1, "clear_red", 0, 255, value.clear_red, error) &&
+            read_game_integer_field(state, -1, "clear_green", 0, 255, value.clear_green, error) &&
+            read_game_integer_field(state, -1, "clear_blue", 0, 255, value.clear_blue, error) &&
+            read_game_integer_field(state, -1, "ambient_red", 0, 255, value.ambient_red, error) &&
+            read_game_integer_field(state, -1, "ambient_green", 0, 255, value.ambient_green, error) &&
+            read_game_integer_field(state, -1, "ambient_blue", 0, 255, value.ambient_blue, error) &&
+            read_game_integer_field(state, -1, "sun_red", 0, 255, value.sun_red, error) &&
+            read_game_integer_field(state, -1, "sun_green", 0, 255, value.sun_green, error) &&
+            read_game_integer_field(state, -1, "sun_blue", 0, 255, value.sun_blue, error) &&
+            read_game_integer_field(state, -1, "cloud_red", 0, 255, value.cloud_red, error) &&
+            read_game_integer_field(state, -1, "cloud_green", 0, 255, value.cloud_green, error) &&
+            read_game_integer_field(state, -1, "cloud_blue", 0, 255, value.cloud_blue, error);
+        lua_pop(state, 1);
+        if (!ok || value.time <= previous_time) {
+            lua_pop(state, 1);
+            if (ok) {
+                error = lua_game_window_field_error("sky_states");
+            }
+            return false;
+        }
+        previous_time = value.time;
+        out.push_back(value);
     }
     lua_pop(state, 1);
     return true;
@@ -349,7 +398,10 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "static_object_radius", 1.0, 10000.0, out.static_object_radius, error) &&
         read_game_integer_field(state, config_index, "grassmap_grid_size", 1, 256, out.grassmap_grid_size, error) &&
         read_game_integer_field(state, config_index, "grassmap_tile_resolution", 1, 4096, out.grassmap_tile_resolution, error) &&
-        read_game_integer_field(state, config_index, "grassmap_world_offset", -100000, 100000, out.grassmap_world_offset, error) &&
+        read_game_integer_field(state, config_index, "grassmap_invert_z", 0, 1, out.grassmap_invert_z, error) &&
+        read_game_number_field(state, config_index, "grass_highland_min_y", -10000.0, 10000.0, out.grass_highland_min_y, error) &&
+        read_game_number_field(state, config_index, "grass_highland_max_y", -10000.0, 10000.0, out.grass_highland_max_y, error) &&
+        read_game_integer_field(state, config_index, "grass_highland_pattern_offset", 0, 30, out.grass_highland_pattern_offset, error) &&
         read_game_number_field(state, config_index, "grass_radius", 1.0, 500.0, out.grass_radius, error) &&
         read_game_number_field(state, config_index, "grass_spacing", 0.25, 100.0, out.grass_spacing, error) &&
         read_game_integer_field(state, config_index, "grass_detail_count", 1, 64, out.grass_detail_count, error) &&
@@ -358,9 +410,19 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "grass_scale_max", 0.01, 10.0, out.grass_scale_max, error) &&
         read_game_number_field(state, config_index, "grass_flatness_radius", 0.1, 20.0, out.grass_flatness_radius, error) &&
         read_game_number_field(state, config_index, "grass_flatness_threshold", 0.0, 20.0, out.grass_flatness_threshold, error) &&
+        read_game_number_field(state, config_index, "grass_flatness_normal_y", 0.0, 1.0, out.grass_flatness_normal_y, error) &&
         read_game_number_field(state, config_index, "grass_generation_margin", 1.0, 100.0, out.grass_generation_margin, error) &&
         read_game_number_field(state, config_index, "grass_wind_amplitude", 0.0, 0.5, out.grass_wind_amplitude, error) &&
         read_game_number_field(state, config_index, "grass_wind_speed", 0.0, 20.0, out.grass_wind_speed, error) &&
+        read_string_array_field(state, config_index, "grass_mode_text", out.grass_mode_text, error) &&
+        read_game_string_field(state, config_index, "sky_texture", out.sky_texture, error) &&
+        read_game_number_field(state, config_index, "sky_radius", 10.0, 10000.0, out.sky_radius, error) &&
+        read_game_number_field(state, config_index, "sky_height_scale", 0.1, 5.0, out.sky_height_scale, error) &&
+        read_game_number_field(state, config_index, "sky_scroll_speed", -10.0, 10.0, out.sky_scroll_speed, error) &&
+        read_game_integer_field(state, config_index, "sky_red", 0, 255, out.sky_red, error) &&
+        read_game_integer_field(state, config_index, "sky_green", 0, 255, out.sky_green, error) &&
+        read_game_integer_field(state, config_index, "sky_blue", 0, 255, out.sky_blue, error) &&
+        read_sky_states(state, config_index, out.sky_states, error) &&
         read_game_string_field(state, config_index, "camera_mode", out.camera_mode, error) &&
         read_game_number_field(state, config_index, "camera_eye_height", 0.1, 20.0, out.camera_eye_height, error) &&
         read_game_number_field(state, config_index, "camera_look_distance", 0.1, 1000.0, out.camera_look_distance, error) &&
@@ -398,6 +460,10 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
     }
     if (out.grass_scale_min > out.grass_scale_max) {
         error = L"lua\\game_window.lua grass_scale_min must not exceed grass_scale_max";
+        return false;
+    }
+    if (out.grass_mode_text.size() != 3) {
+        error = L"lua\\game_window.lua grass_mode_text must contain exactly three labels";
         return false;
     }
     if (out.near_clip >= out.far_clip || out.fog_start >= out.fog_end || out.fog_end > out.far_clip ||

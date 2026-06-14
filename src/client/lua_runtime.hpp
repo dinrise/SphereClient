@@ -31,6 +31,22 @@ struct LuaGrassSampleOffset {
     float z = 0.0f;
 };
 
+struct LuaSkyState {
+    float time = 0.0f;
+    int clear_red = 0;
+    int clear_green = 0;
+    int clear_blue = 0;
+    int ambient_red = 0;
+    int ambient_green = 0;
+    int ambient_blue = 0;
+    int sun_red = 0;
+    int sun_green = 0;
+    int sun_blue = 0;
+    int cloud_red = 0;
+    int cloud_green = 0;
+    int cloud_blue = 0;
+};
+
 struct LuaGameWindowConfig {
     bool ok = false;
     std::vector<std::wstring> ui_windows;
@@ -40,7 +56,7 @@ struct LuaGameWindowConfig {
     std::vector<std::wstring> model_dirs;
     std::vector<std::wstring> static_object_dirs;
     std::wstring grassmap_dir;
-    std::array<std::vector<std::wstring>, 16> grass_patterns{};
+    std::array<std::vector<std::wstring>, 31> grass_patterns{};
     std::vector<std::wstring> grass_detail_models;
     std::vector<LuaGrassSampleOffset> grass_sample_offsets;
     std::wstring terrain_microtexture;
@@ -52,7 +68,10 @@ struct LuaGameWindowConfig {
     float static_object_radius = 0.0f;
     int grassmap_grid_size = 0;
     int grassmap_tile_resolution = 0;
-    int grassmap_world_offset = 0;
+    int grassmap_invert_z = 0;
+    float grass_highland_min_y = 0.0f;
+    float grass_highland_max_y = 0.0f;
+    int grass_highland_pattern_offset = 0;
     int grass_quality = 0;
     float grass_radius = 0.0f;
     float grass_spacing = 0.0f;
@@ -62,10 +81,20 @@ struct LuaGameWindowConfig {
     float grass_scale_max = 0.0f;
     float grass_flatness_radius = 0.0f;
     float grass_flatness_threshold = 0.0f;
+    float grass_flatness_normal_y = 0.0f;
     float grass_generation_margin = 0.0f;
     float grass_wind_amplitude = 0.0f;
     float grass_wind_speed = 0.0f;
+    std::vector<std::wstring> grass_mode_text;
     std::wstring camera_mode;
+    std::wstring sky_texture;
+    float sky_radius = 0.0f;
+    float sky_height_scale = 0.0f;
+    float sky_scroll_speed = 0.0f;
+    int sky_red = 0;
+    int sky_green = 0;
+    int sky_blue = 0;
+    std::vector<LuaSkyState> sky_states;
     float camera_eye_height = 0.0f;
     float camera_look_distance = 0.0f;
     float camera_turn_speed = 0.0f;

@@ -35,7 +35,12 @@ M.static_object_dirs = {
 M.grassmap_dir = "landscape/grassmap"
 M.grassmap_grid_size = 16
 M.grassmap_tile_resolution = 256
-M.grassmap_world_offset = 2048
+-- GrassMap uses source-world coordinates. The D3D scene mirrors source Z.
+M.grassmap_invert_z = 1
+-- FUN_00457020 switches to the second 15-pattern bank at this world height.
+M.grass_highland_min_y = 300.0
+M.grass_highland_max_y = 800.0
+M.grass_highland_pattern_offset = 15
 M.grass_radius = 42.0
 M.grass_spacing = 8.3333
 M.grass_detail_models = {"grass_s00", "grass_s01", "grass_s02", "grass_s03"}
@@ -50,12 +55,36 @@ M.grass_detail_count = 8
 M.grass_jitter_fraction = 0.25
 M.grass_scale_min = 0.6
 M.grass_scale_max = 1.1
-M.grass_flatness_radius = 1.5
-M.grass_flatness_threshold = 0.35
+-- Recovered from FUN_00470640.
+M.grass_flatness_radius = 2.45
+M.grass_flatness_threshold = 0.5
+M.grass_flatness_normal_y = 0.75
 M.grass_generation_margin = 16.0
 M.grass_wind_amplitude = 0.018
 M.grass_wind_speed = 1.35
+M.grass_mode_text = {"Выкл", "Вкл", "Аним"}
 M.terrain_microtexture = "landscape/bs_.mtx"
+-- Sky.txt t00, active through the original weather manager.
+M.sky_texture = "landscape/clouds.dds"
+M.sky_radius = 220.0
+M.sky_height_scale = 0.55
+M.sky_scroll_speed = 0.002
+M.sky_red = 200
+M.sky_green = 200
+M.sky_blue = 200
+-- Recovered from landscape/Sky.txt (c/d states) and weather.txt t00c.
+M.sky_states = {
+    {time=0.000, clear_red=0,  clear_green=0,   clear_blue=0,   ambient_red=53,  ambient_green=57,  ambient_blue=83,  sun_red=60,  sun_green=70,  sun_blue=100, cloud_red=105, cloud_green=105, cloud_blue=105},
+    {time=0.167, clear_red=0,  clear_green=0,   clear_blue=0,   ambient_red=96,  ambient_green=102, ambient_blue=148, sun_red=60,  sun_green=70,  sun_blue=100, cloud_red=105, cloud_green=105, cloud_blue=105},
+    {time=0.200, clear_red=40, clear_green=35,  clear_blue=35,  ambient_red=140, ambient_green=140, ambient_blue=140, sun_red=0,   sun_green=0,   sun_blue=0,   cloud_red=140, cloud_green=105, cloud_blue=70},
+    {time=0.266, clear_red=90, clear_green=104, clear_blue=122, ambient_red=115, ambient_green=105, ambient_blue=100, sun_red=120, sun_green=60,  sun_blue=23,  cloud_red=169, cloud_green=104, cloud_blue=34},
+    {time=0.335, clear_red=50, clear_green=160, clear_blue=250, ambient_red=97,  ambient_green=118, ambient_blue=142, sun_red=243, sun_green=202, sun_blue=166, cloud_red=200, cloud_green=200, cloud_blue=200},
+    {time=0.667, clear_red=50, clear_green=160, clear_blue=250, ambient_red=97,  ambient_green=118, ambient_blue=142, sun_red=243, sun_green=202, sun_blue=166, cloud_red=200, cloud_green=200, cloud_blue=200},
+    {time=0.733, clear_red=90, clear_green=104, clear_blue=122, ambient_red=115, ambient_green=105, ambient_blue=100, sun_red=120, sun_green=60,  sun_blue=23,  cloud_red=169, cloud_green=104, cloud_blue=34},
+    {time=0.810, clear_red=40, clear_green=35,  clear_blue=35,  ambient_red=120, ambient_green=120, ambient_blue=120, sun_red=0,   sun_green=0,   sun_blue=0,   cloud_red=140, cloud_green=110, cloud_blue=70},
+    {time=0.840, clear_red=0,  clear_green=0,   clear_blue=0,   ambient_red=103, ambient_green=103, ambient_blue=123, sun_red=0,   sun_green=0,   sun_blue=0,   cloud_red=115, cloud_green=115, cloud_blue=115},
+    {time=0.864, clear_red=0,  clear_green=0,   clear_blue=0,   ambient_red=96,  ambient_green=102, ambient_blue=148, sun_red=60,  sun_green=70,  sun_blue=100, cloud_red=105, cloud_green=105, cloud_blue=105},
+}
 
 -- Recovered from FUN_00460570: grass-map type -> five model variants.
 M.grass_patterns = {
@@ -74,6 +103,21 @@ M.grass_patterns = {
     [13] = {"grass007", "grass007", "grass007", "grass007", "grass015"},
     [14] = {"grass017", "grass017", "grass017", "grass005", "grass005"},
     [15] = {"grass001", "grass001", "grass001", "grass001", "grass007"},
+    [16] = {"grass000", "grass000", "grass000", "grass000", "grass000"},
+    [17] = {"grass000", "grass000", "grass000", "grass000", "grass000"},
+    [18] = {"grass000", "grass000", "grass000", "grass000", "grass000"},
+    [19] = {"grass101", "grass101", "grass101", "grass101", "grass101"},
+    [20] = {"grass102", "grass102", "grass102", "grass102", "grass102"},
+    [21] = {"grass100", "grass100", "grass100", "grass101", "grass101"},
+    [22] = {"grass101", "grass101", "grass101", "grass102", "grass102"},
+    [23] = {"grass100", "grass100", "grass100", "grass102", "grass102"},
+    [24] = {"grass100", "grass100", "grass100", "grass101", "grass102"},
+    [25] = {"grass100", "grass100", "grass101", "grass102", "grass102"},
+    [26] = {"grass101", "grass101", "grass101", "grass101", "grass101"},
+    [27] = {"grass102", "grass102", "grass102", "grass102", "grass102"},
+    [28] = {"grass100", "grass100", "grass100", "grass101", "grass101"},
+    [29] = {"grass101", "grass101", "grass101", "grass102", "grass102"},
+    [30] = {"grass100", "grass100", "grass100", "grass102", "grass102"},
 }
 M.grid_width = 80
 M.origin_row = 40

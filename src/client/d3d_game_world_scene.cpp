@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -123,6 +124,8 @@ struct GrassInstance {
     D3DMATRIX world{};
     float wind_phase = 0.0f;
     float wind_scale = 1.0f;
+    int cell_x = 0;
+    int cell_z = 0;
 };
 
 template <typename T>
@@ -298,6 +301,27 @@ D3DMATRIX scale_matrix(float scale) {
     matrix._11 = scale;
     matrix._22 = scale;
     matrix._33 = scale;
+    return matrix;
+}
+
+D3DMATRIX align_up_matrix(Vec3 normal) {
+    normal = normalize(normal);
+    Vec3 tangent = cross(normal, Vec3{0.0f, 0.0f, 1.0f});
+    if (dot(tangent, tangent) <= 0.00001f) {
+        tangent = cross(normal, Vec3{1.0f, 0.0f, 0.0f});
+    }
+    tangent = normalize(tangent);
+    const Vec3 bitangent = normalize(cross(tangent, normal));
+    auto matrix = identity_matrix();
+    matrix._11 = tangent.x;
+    matrix._12 = tangent.y;
+    matrix._13 = tangent.z;
+    matrix._21 = normal.x;
+    matrix._22 = normal.y;
+    matrix._23 = normal.z;
+    matrix._31 = bitangent.x;
+    matrix._32 = bitangent.y;
+    matrix._33 = bitangent.z;
     return matrix;
 }
 
@@ -545,6 +569,7 @@ struct GameWorldScene::Impl {
     IDirect3DDevice9* device = nullptr;
     IDirect3DTexture9* overlay_texture = nullptr;
     IDirect3DTexture9* terrain_microtexture = nullptr;
+    IDirect3DTexture9* sky_texture = nullptr;
     IDirect3DVertexBuffer9* player_vertex_buffer = nullptr;
     IDirect3DIndexBuffer9* player_index_buffer = nullptr;
     D3DPRESENT_PARAMETERS present{};
@@ -557,6 +582,7 @@ struct GameWorldScene::Impl {
     std::vector<StaticInstance> static_instances;
     std::vector<GrassInstance> grass_instances;
     std::unordered_map<int, std::vector<std::uint8_t>> grass_maps;
+    std::unordered_set<std::uint64_t> grass_cells;
     std::vector<PlayerBatch> player_batches;
     UINT player_vertex_count = 0;
     float spawn_x = 0.0f;
@@ -572,6 +598,19 @@ struct GameWorldScene::Impl {
     float grass_anchor_x = 0.0f;
     float grass_anchor_z = 0.0f;
     float elapsed_seconds = 0.0f;
+    float game_time_fraction = 0.0f;
+    int environment_clear_red = 0;
+    int environment_clear_green = 0;
+    int environment_clear_blue = 0;
+    int environment_ambient_red = 110;
+    int environment_ambient_green = 110;
+    int environment_ambient_blue = 110;
+    int environment_sun_red = 255;
+    int environment_sun_green = 245;
+    int environment_sun_blue = 224;
+    int environment_cloud_red = 200;
+    int environment_cloud_green = 200;
+    int environment_cloud_blue = 200;
     bool grass_anchor_valid = false;
     int overlay_width = 0;
     int overlay_height = 0;
@@ -584,6 +623,7 @@ struct GameWorldScene::Impl {
     void release() {
         release_com(overlay_texture);
         release_com(terrain_microtexture);
+        release_com(sky_texture);
         for (auto& batch : player_batches) {
             release_com(batch.texture);
         }
@@ -603,6 +643,7 @@ struct GameWorldScene::Impl {
             release_com(resource->vertex_buffer);
         }
         grass_instances.clear();
+        grass_cells.clear();
         grass_maps.clear();
         static_instances.clear();
         static_placements.clear();
@@ -1024,8 +1065,9 @@ struct GameWorldScene::Impl {
     }
 
     std::uint8_t grass_type_at(float world_x, float world_z) {
-        const int map_x = static_cast<int>(std::floor(world_x)) + config.grassmap_world_offset;
-        const int map_z = static_cast<int>(std::floor(world_z)) + config.grassmap_world_offset;
+        const int map_x = static_cast<int>(std::floor(world_x));
+        const float source_z = config.grassmap_invert_z != 0 ? -world_z : world_z;
+        const int map_z = static_cast<int>(std::floor(source_z));
         const int world_resolution = config.grassmap_grid_size * config.grassmap_tile_resolution;
         if (map_x < 0 || map_z < 0 || map_x >= world_resolution || map_z >= world_resolution) {
             return 0;
@@ -1035,12 +1077,20 @@ struct GameWorldScene::Impl {
         const int local_x = map_x % config.grassmap_tile_resolution;
         const int local_z = map_z % config.grassmap_tile_resolution;
         const auto& map = load_grass_map(chunk_x, chunk_z);
-        return map[static_cast<std::size_t>(local_z) * config.grassmap_tile_resolution + local_x] & 0x0f;
+        std::uint8_t type =
+            map[static_cast<std::size_t>(local_z) * config.grassmap_tile_resolution + local_x] & 0x0f;
+        if (type != 0 &&
+            spawn_y > config.grass_highland_min_y &&
+            spawn_y < config.grass_highland_max_y) {
+            type = static_cast<std::uint8_t>(type + config.grass_highland_pattern_offset);
+        }
+        return type;
     }
 
     void load_visible_grass() {
-        grass_instances.clear();
         if (config.grass_quality <= 0) {
+            grass_instances.clear();
+            grass_cells.clear();
             return;
         }
         if (config.grass_detail_models.empty()) {
@@ -1049,30 +1099,55 @@ struct GameWorldScene::Impl {
         if (config.grass_sample_offsets.empty()) {
             throw std::runtime_error("grass_sample_offsets is empty");
         }
-        const float spacing = config.grass_quality >= 2 ? config.grass_spacing : config.grass_spacing * 2.0f;
-        const float sample_scale = spacing / config.grass_spacing;
+        const float spacing = config.grass_spacing;
         grass_anchor_x = spawn_x;
         grass_anchor_z = spawn_z;
         grass_anchor_valid = true;
         grass_center_x = static_cast<int>(std::floor(grass_anchor_x / spacing));
-        grass_center_z = static_cast<int>(std::floor(grass_anchor_z / spacing));
+        const bool invert_z = config.grassmap_invert_z != 0;
+        const float grass_anchor_source_z = invert_z ? -grass_anchor_z : grass_anchor_z;
+        grass_center_z = static_cast<int>(std::floor(grass_anchor_source_z / spacing));
         const float generation_radius = config.grass_radius + config.grass_generation_margin;
-        const float radius_squared = generation_radius * generation_radius;
-        const float first_x = std::floor((grass_anchor_x - generation_radius) / spacing) * spacing;
-        const float first_z = std::floor((grass_anchor_z - generation_radius) / spacing) * spacing;
-        for (float x = first_x; x <= grass_anchor_x + generation_radius; x += spacing) {
-            for (float z = first_z; z <= grass_anchor_z + generation_radius; z += spacing) {
-                const auto cell_x = static_cast<std::uint32_t>(static_cast<std::int32_t>(std::floor(x / spacing)));
-                const auto cell_z = static_cast<std::uint32_t>(static_cast<std::int32_t>(std::floor(z / spacing)));
+        const int cell_radius = static_cast<int>(std::ceil(generation_radius / spacing)) + 1;
+        const float cell_selection_radius = generation_radius + spacing;
+        const float cell_selection_radius_squared = cell_selection_radius * cell_selection_radius;
+        auto cell_key = [](int x, int z) {
+            return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
+                   static_cast<std::uint32_t>(z);
+        };
+        std::unordered_set<std::uint64_t> target_cells;
+        for (int cell_x = grass_center_x - cell_radius; cell_x <= grass_center_x + cell_radius; ++cell_x) {
+            for (int cell_z = grass_center_z - cell_radius; cell_z <= grass_center_z + cell_radius; ++cell_z) {
+                const float x = static_cast<float>(cell_x) * spacing;
+                const float source_z = static_cast<float>(cell_z) * spacing;
+                const float dx = x + spacing * 0.5f - grass_anchor_x;
+                const float dz = source_z + spacing * 0.5f - grass_anchor_source_z;
+                if (dx * dx + dz * dz <= cell_selection_radius_squared) {
+                    target_cells.insert(cell_key(cell_x, cell_z));
+                }
+            }
+        }
+        std::erase_if(grass_instances, [&target_cells, &cell_key](const GrassInstance& instance) {
+            return !target_cells.contains(cell_key(instance.cell_x, instance.cell_z));
+        });
+        std::erase_if(grass_cells, [&target_cells](std::uint64_t key) {
+            return !target_cells.contains(key);
+        });
+
+        for (int cell_x = grass_center_x - cell_radius; cell_x <= grass_center_x + cell_radius; ++cell_x) {
+            for (int cell_z = grass_center_z - cell_radius; cell_z <= grass_center_z + cell_radius; ++cell_z) {
+                const auto key = cell_key(cell_x, cell_z);
+                if (!target_cells.contains(key) || grass_cells.contains(key)) {
+                    continue;
+                }
+                grass_cells.insert(key);
+                const float x = static_cast<float>(cell_x) * spacing;
+                const float source_z = static_cast<float>(cell_z) * spacing;
                 for (std::size_t sample_index = 0; sample_index < config.grass_sample_offsets.size(); ++sample_index) {
                     const auto& sample_offset = config.grass_sample_offsets[sample_index];
-                    const float sample_x = x + sample_offset.x * sample_scale;
-                    const float sample_z = z + sample_offset.z * sample_scale;
-                    const float dx = sample_x - grass_anchor_x;
-                    const float dz = sample_z - grass_anchor_z;
-                    if (dx * dx + dz * dz > radius_squared) {
-                        continue;
-                    }
+                    const float sample_x = x + sample_offset.x;
+                    const float sample_source_z = source_z + sample_offset.z;
+                    const float sample_z = invert_z ? -sample_source_z : sample_source_z;
                     const auto type = grass_type_at(sample_x, sample_z);
                     if (type == 0 || type >= config.grass_patterns.size()) {
                         continue;
@@ -1082,8 +1157,8 @@ struct GameWorldScene::Impl {
                     }
 
                     std::uint32_t random_state =
-                        (cell_x * 0x9e3779b9U) ^
-                        (cell_z * 0x85ebca6bU) ^
+                        (static_cast<std::uint32_t>(cell_x) * 0x9e3779b9U) ^
+                        (static_cast<std::uint32_t>(cell_z) * 0x85ebca6bU) ^
                         (static_cast<std::uint32_t>(sample_index) * 0xc2b2ae35U) ^
                         type;
                     auto next_random = [&random_state]() {
@@ -1097,7 +1172,8 @@ struct GameWorldScene::Impl {
                     };
 
                     float flat_height = 0.0f;
-                    if (flat_grass_surface_at(sample_x, sample_z, spawn_y, flat_height)) {
+                    Vec3 flat_normal{};
+                    if (flat_grass_surface_at(sample_x, sample_z, flat_height, flat_normal)) {
                         const auto& configured_model =
                             config.grass_patterns[type][next_random() % config.grass_patterns[type].size()];
                         const auto model_name = narrow_ascii(configured_model);
@@ -1108,7 +1184,9 @@ struct GameWorldScene::Impl {
                                 key,
                                 load_static_model_resource(model_name, resolve_model_path(model_name))).first;
                         }
-                        auto world = rotation_y_matrix(unit_random() * 2.0f * kPi);
+                        auto world = multiply_matrix(
+                            rotation_y_matrix(unit_random() * 2.0f * kPi),
+                            align_up_matrix(flat_normal));
                         world._41 = sample_x;
                         world._42 = flat_height - resource->second->bounds_max.y;
                         world._43 = sample_z;
@@ -1117,19 +1195,22 @@ struct GameWorldScene::Impl {
                             world,
                             unit_random() * 2.0f * kPi,
                             0.65f + unit_random() * 0.35f,
+                            cell_x,
+                            cell_z,
                         });
                         continue;
                     }
 
-                    const int detail_count = config.grass_quality >= 2
-                        ? config.grass_detail_count
-                        : (std::max)(1, config.grass_detail_count / 2);
+                    const int detail_count = config.grass_detail_count;
                     for (int detail = 0; detail < detail_count; ++detail) {
                         const float jitter = config.grass_spacing * config.grass_jitter_fraction;
                         const float detail_x = sample_x + (unit_random() * 2.0f - 1.0f) * jitter;
-                        const float detail_z = sample_z + (unit_random() * 2.0f - 1.0f) * jitter;
+                        const float detail_source_z =
+                            sample_source_z + (unit_random() * 2.0f - 1.0f) * jitter;
+                        const float detail_z = invert_z ? -detail_source_z : detail_source_z;
                         float height = 0.0f;
-                        if (!terrain_height_at(detail_x, detail_z, spawn_y, height)) {
+                        Vec3 detail_normal{};
+                        if (!terrain_surface_at(detail_x, detail_z, height, detail_normal)) {
                             continue;
                         }
                         const auto& configured_model =
@@ -1155,6 +1236,8 @@ struct GameWorldScene::Impl {
                             world,
                             unit_random() * 2.0f * kPi,
                             0.65f + unit_random() * 0.35f,
+                            cell_x,
+                            cell_z,
                         });
                     }
                 }
@@ -1305,7 +1388,9 @@ struct GameWorldScene::Impl {
         device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
         device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
         device->SetRenderState(D3DRS_LIGHTING, TRUE);
-        device->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(110, 110, 110));
+        device->SetRenderState(
+            D3DRS_AMBIENT,
+            D3DCOLOR_XRGB(environment_ambient_red, environment_ambient_green, environment_ambient_blue));
         device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
         device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
         device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_COLOR1);
@@ -1324,7 +1409,9 @@ struct GameWorldScene::Impl {
         device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
         device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
         device->SetRenderState(D3DRS_FOGENABLE, TRUE);
-        device->SetRenderState(D3DRS_FOGCOLOR, D3DCOLOR_XRGB(config.clear_red, config.clear_green, config.clear_blue));
+        device->SetRenderState(
+            D3DRS_FOGCOLOR,
+            D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue));
         device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
         DWORD fog_start = 0;
         DWORD fog_end = 0;
@@ -1340,9 +1427,9 @@ struct GameWorldScene::Impl {
 
         D3DLIGHT9 light{};
         light.Type = D3DLIGHT_DIRECTIONAL;
-        light.Diffuse.r = 1.0f;
-        light.Diffuse.g = 0.96f;
-        light.Diffuse.b = 0.88f;
+        light.Diffuse.r = static_cast<float>(environment_sun_red) / 255.0f;
+        light.Diffuse.g = static_cast<float>(environment_sun_green) / 255.0f;
+        light.Diffuse.b = static_cast<float>(environment_sun_blue) / 255.0f;
         light.Ambient.r = light.Ambient.g = light.Ambient.b = 0.35f;
         light.Direction.x = -0.35f;
         light.Direction.y = -0.75f;
@@ -1398,13 +1485,65 @@ struct GameWorldScene::Impl {
         return false;
     }
 
-    bool flat_grass_surface_at(float world_x, float world_z, float reference_y, float& out_height) const {
-        float center_height = 0.0f;
-        if (!terrain_height_at(world_x, world_z, reference_y, center_height)) {
+    bool terrain_surface_at(float world_x, float world_z, float& out_height, Vec3& out_normal) const {
+        float best_height = -std::numeric_limits<float>::max();
+        Vec3 best_normal{};
+        bool found = false;
+        for (const auto& instance : instances) {
+            const float local_x = world_x - instance.origin_x;
+            const float local_z = world_z - instance.origin_z;
+            if (local_x < -0.01f || local_x > config.tile_size + 0.01f ||
+                local_z < -0.01f || local_z > config.tile_size + 0.01f) {
+                continue;
+            }
+            const auto& positions = instance.resource->positions;
+            const auto& indices = instance.resource->indices;
+            for (std::size_t i = 0; i + 2 < indices.size(); i += 3) {
+                const auto& a = positions[indices[i]];
+                const auto& b = positions[indices[i + 1]];
+                const auto& c = positions[indices[i + 2]];
+                const float denominator =
+                    (b.z - c.z) * (a.x - c.x) +
+                    (c.x - b.x) * (a.z - c.z);
+                if (std::abs(denominator) <= 0.000001f) {
+                    continue;
+                }
+                const float wa =
+                    ((b.z - c.z) * (local_x - c.x) +
+                     (c.x - b.x) * (local_z - c.z)) / denominator;
+                const float wb =
+                    ((c.z - a.z) * (local_x - c.x) +
+                     (a.x - c.x) * (local_z - c.z)) / denominator;
+                const float wc = 1.0f - wa - wb;
+                if (wa < -0.001f || wb < -0.001f || wc < -0.001f) {
+                    continue;
+                }
+                const float height = wa * a.y + wb * b.y + wc * c.y;
+                if (!found || height > best_height) {
+                    best_height = height;
+                    best_normal = normalize(cross(subtract(b, a), subtract(c, a)));
+                    if (best_normal.y < 0.0f) {
+                        best_normal = scale(best_normal, -1.0f);
+                    }
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
             return false;
         }
-        float min_height = center_height;
-        float max_height = center_height;
+        out_height = best_height;
+        out_normal = best_normal;
+        return true;
+    }
+
+    bool flat_grass_surface_at(float world_x, float world_z, float& out_height, Vec3& out_normal) const {
+        float center_height = 0.0f;
+        Vec3 center_normal{};
+        if (!terrain_surface_at(world_x, world_z, center_height, center_normal) ||
+            std::abs(center_normal.y) < config.grass_flatness_normal_y) {
+            return false;
+        }
         const float radius = config.grass_flatness_radius;
         const float diagonal = radius * 0.70710678f;
         const Vec3 offsets[] = {
@@ -1419,16 +1558,19 @@ struct GameWorldScene::Impl {
         };
         for (const auto& offset : offsets) {
             float height = 0.0f;
-            if (!terrain_height_at(world_x + offset.x, world_z + offset.z, center_height, height)) {
+            Vec3 normal{};
+            if (!terrain_surface_at(world_x + offset.x, world_z + offset.z, height, normal)) {
                 return false;
             }
-            min_height = (std::min)(min_height, height);
-            max_height = (std::max)(max_height, height);
-        }
-        if (max_height - min_height > config.grass_flatness_threshold) {
-            return false;
+            const float expected_height =
+                center_height -
+                (center_normal.x * offset.x + center_normal.z * offset.z) / center_normal.y;
+            if (std::abs(height - expected_height) > config.grass_flatness_threshold) {
+                return false;
+            }
         }
         out_height = center_height;
+        out_normal = center_normal;
         return true;
     }
 
@@ -1573,11 +1715,13 @@ struct GameWorldScene::Impl {
             world._41 = 0.0f;
             world._42 = 0.0f;
             world._43 = 0.0f;
-            const float sway =
-                std::sin(elapsed_seconds * config.grass_wind_speed + instance.wind_phase) *
-                config.grass_wind_amplitude *
-                instance.wind_scale;
-            world = multiply_matrix(world, rotation_z_matrix(sway));
+            if (config.grass_quality == 2) {
+                const float sway =
+                    std::sin(elapsed_seconds * config.grass_wind_speed + instance.wind_phase) *
+                    config.grass_wind_amplitude *
+                    instance.wind_scale;
+                world = multiply_matrix(world, rotation_z_matrix(sway));
+            }
             world._41 = x;
             world._42 = y;
             world._43 = z;
@@ -1596,6 +1740,78 @@ struct GameWorldScene::Impl {
             }
         }
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    }
+
+    void draw_sky() {
+        constexpr int rings = 8;
+        constexpr int segments = 32;
+        std::vector<WorldVertex> vertices;
+        std::vector<std::uint16_t> indices;
+        vertices.reserve((rings + 1) * (segments + 1));
+        indices.reserve(rings * segments * 6);
+        const DWORD color = D3DCOLOR_XRGB(environment_cloud_red, environment_cloud_green, environment_cloud_blue);
+        const float scroll = elapsed_seconds * config.sky_scroll_speed;
+        for (int ring = 0; ring <= rings; ++ring) {
+            const float v = static_cast<float>(ring) / static_cast<float>(rings);
+            const float theta = v * kPi * 0.5f;
+            const float radial = std::sin(theta) * config.sky_radius;
+            const float height = std::cos(theta) * config.sky_radius * config.sky_height_scale;
+            for (int segment = 0; segment <= segments; ++segment) {
+                const float u = static_cast<float>(segment) / static_cast<float>(segments);
+                const float angle = u * 2.0f * kPi;
+                vertices.push_back(WorldVertex{
+                    spawn_x + std::cos(angle) * radial,
+                    spawn_y - height,
+                    spawn_z + std::sin(angle) * radial,
+                    0.0f,
+                    -1.0f,
+                    0.0f,
+                    color,
+                    u + scroll,
+                    v,
+                    0.0f,
+                    0.0f,
+                });
+            }
+        }
+        for (int ring = 0; ring < rings; ++ring) {
+            for (int segment = 0; segment < segments; ++segment) {
+                const auto a = static_cast<std::uint16_t>(ring * (segments + 1) + segment);
+                const auto b = static_cast<std::uint16_t>(a + segments + 1);
+                indices.push_back(a);
+                indices.push_back(b);
+                indices.push_back(static_cast<std::uint16_t>(a + 1));
+                indices.push_back(static_cast<std::uint16_t>(a + 1));
+                indices.push_back(b);
+                indices.push_back(static_cast<std::uint16_t>(b + 1));
+            }
+        }
+
+        device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetFVF(kWorldVertexFvf);
+        device->SetTexture(0, sky_texture);
+        const auto identity = identity_matrix();
+        device->SetTransform(D3DTS_WORLD, &identity);
+        device->DrawIndexedPrimitiveUP(
+            D3DPT_TRIANGLELIST,
+            0,
+            static_cast<UINT>(vertices.size()),
+            static_cast<UINT>(indices.size() / 3),
+            indices.data(),
+            D3DFMT_INDEX16,
+            vertices.data(),
+            sizeof(WorldVertex));
+        configure_render_state();
     }
 
     void draw_player() {
@@ -1667,6 +1883,12 @@ struct GameWorldScene::Impl {
         hwnd = window;
         root_path = root;
         config = world_config;
+        environment_clear_red = config.clear_red;
+        environment_clear_green = config.clear_green;
+        environment_clear_blue = config.clear_blue;
+        environment_cloud_red = config.sky_red;
+        environment_cloud_green = config.sky_green;
+        environment_cloud_blue = config.sky_blue;
         spawn_x = static_cast<float>(x);
         spawn_y = static_cast<float>(y);
         spawn_z = static_cast<float>(z);
@@ -1677,6 +1899,7 @@ struct GameWorldScene::Impl {
         }
         try {
             terrain_microtexture = load_mtx_texture(device, root_path / config.terrain_microtexture);
+            sky_texture = load_dds_texture(device, root_path / config.sky_texture);
             load_visible_terrain();
             snap_to_ground();
             load_visible_grass();
@@ -1736,7 +1959,11 @@ struct GameWorldScene::Impl {
         if (config.grass_quality == quality) {
             return true;
         }
+        const bool visibility_changed = (config.grass_quality == 0) != (quality == 0);
         config.grass_quality = quality;
+        if (!visibility_changed) {
+            return true;
+        }
         grass_center_x = (std::numeric_limits<int>::min)();
         grass_center_z = (std::numeric_limits<int>::min)();
         grass_anchor_valid = false;
@@ -1749,12 +1976,68 @@ struct GameWorldScene::Impl {
         }
     }
 
+    void set_game_time(float day_fraction) {
+        game_time_fraction = day_fraction - std::floor(day_fraction);
+        const auto& states = config.sky_states;
+        if (states.size() < 2) {
+            return;
+        }
+        std::size_t next = 0;
+        while (next < states.size() && game_time_fraction >= states[next].time) {
+            ++next;
+        }
+        const LuaSkyState* from = nullptr;
+        const LuaSkyState* to = nullptr;
+        float from_time = 0.0f;
+        float to_time = 0.0f;
+        if (next == 0) {
+            from = &states.back();
+            to = &states.front();
+            from_time = states.back().time - 1.0f;
+            to_time = states.front().time;
+        } else if (next == states.size()) {
+            from = &states.back();
+            to = &states.front();
+            from_time = states.back().time;
+            to_time = states.front().time + 1.0f;
+        } else {
+            from = &states[next - 1];
+            to = &states[next];
+            from_time = from->time;
+            to_time = to->time;
+        }
+        float sample_time = game_time_fraction;
+        if (sample_time < from_time) {
+            sample_time += 1.0f;
+        }
+        const float blend = std::clamp((sample_time - from_time) / (to_time - from_time), 0.0f, 1.0f);
+        auto channel = [blend](int a, int b) {
+            return static_cast<int>(std::lround(static_cast<float>(a) + static_cast<float>(b - a) * blend));
+        };
+        environment_clear_red = channel(from->clear_red, to->clear_red);
+        environment_clear_green = channel(from->clear_green, to->clear_green);
+        environment_clear_blue = channel(from->clear_blue, to->clear_blue);
+        environment_ambient_red = channel(from->ambient_red, to->ambient_red);
+        environment_ambient_green = channel(from->ambient_green, to->ambient_green);
+        environment_ambient_blue = channel(from->ambient_blue, to->ambient_blue);
+        environment_sun_red = channel(from->sun_red, to->sun_red);
+        environment_sun_green = channel(from->sun_green, to->sun_green);
+        environment_sun_blue = channel(from->sun_blue, to->sun_blue);
+        environment_cloud_red = channel(from->cloud_red, to->cloud_red);
+        environment_cloud_green = channel(from->cloud_green, to->cloud_green);
+        environment_cloud_blue = channel(from->cloud_blue, to->cloud_blue);
+        if (device) {
+            configure_render_state();
+        }
+    }
+
     bool update(float delta_seconds, const GameMovementInput& input, std::wstring& error) {
         if (!initialized) {
             error = L"game world scene is not initialized";
             return false;
         }
         elapsed_seconds += (std::max)(0.0f, delta_seconds);
+        set_game_time(game_time_fraction + (std::max)(0.0f, delta_seconds) * 12.0f / 86400.0f);
         const float forward = (input.forward ? 1.0f : 0.0f) - (input.backward ? 1.0f : 0.0f);
         const float right = (input.strafe_right ? 1.0f : 0.0f) - (input.strafe_left ? 1.0f : 0.0f);
         const float input_length = std::sqrt(forward * forward + right * right);
@@ -1864,10 +2147,11 @@ struct GameWorldScene::Impl {
             0,
             nullptr,
             D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-            D3DCOLOR_XRGB(config.clear_red, config.clear_green, config.clear_blue),
+            D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue),
             1.0f,
             0);
         if (SUCCEEDED(device->BeginScene())) {
+            draw_sky();
             draw_terrain();
             draw_grass();
             draw_static_objects();
@@ -1900,6 +2184,10 @@ bool GameWorldScene::set_overlay_bitmap(int width, int height, std::vector<std::
 
 bool GameWorldScene::set_grass_quality(int quality, std::wstring& error) {
     return impl_->set_grass_quality(quality, error);
+}
+
+void GameWorldScene::set_game_time(float day_fraction) {
+    impl_->set_game_time(day_fraction);
 }
 
 bool GameWorldScene::update(float delta_seconds, const GameMovementInput& input, std::wstring& error) {

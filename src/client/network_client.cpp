@@ -625,10 +625,43 @@ void read_action_frames(SOCKET socket, CharacterActionResult& result, int max_fr
     }
 }
 
-void drain_available_frames(SOCKET socket) {
-    std::vector<std::uint8_t> frame;
-    for (int i = 0; i < 8 && recv_frame(socket, frame, 0); ++i) {
+void read_available_frames(SOCKET socket, CharacterActionResult& result, int max_frames) {
+    while (result.packet_count < max_frames) {
+        u_long available = 0;
+        if (ioctlsocket(socket, FIONREAD, &available) != 0 || available < 2) {
+            break;
+        }
+        std::uint8_t header[2]{};
+        if (recv(socket, reinterpret_cast<char*>(header), 2, MSG_PEEK) != 2) {
+            break;
+        }
+        const int length = header[0] | (header[1] << 8);
+        if (length < 4 || length > 60000 || available < static_cast<u_long>(length)) {
+            break;
+        }
+        std::vector<std::uint8_t> frame;
+        if (!recv_frame(socket, frame, 0)) {
+            break;
+        }
+        ++result.packet_count;
+        result.byte_count += static_cast<int>(frame.size());
+        result.frames.push_back(std::move(frame));
     }
+}
+
+bool decode_server_credentials_time(const std::vector<std::uint8_t>& frame, float& fraction) {
+    if (frame.size() != 56 || read_u16le(frame, 2) != 300 ||
+        frame[9] != 0x08 || frame[10] != 0x40 || frame[11] != 0x20 || frame[12] != 0x10) {
+        return false;
+    }
+    const int seconds = ((frame[13] & 0x0f) - 1) * 12;
+    const int minutes = ((frame[14] & 0x03) << 4) | (frame[13] >> 4);
+    const int hours = (frame[14] >> 2) & 0x1f;
+    if (seconds < 0 || seconds >= 60 || minutes >= 60 || hours >= 24) {
+        return false;
+    }
+    fraction = static_cast<float>(hours * 3600 + minutes * 60 + seconds) / 86400.0f;
+    return true;
 }
 
 bool is_socket_connected(const SocketHandle& socket) {
@@ -642,6 +675,8 @@ struct ServerSession::Impl {
     SocketHandle socket;
     std::uint16_t local_id = 0;
     std::uint8_t position_sequence = 0;
+    bool has_game_time = false;
+    float game_time_fraction = 0.0f;
 };
 
 ServerSession::ServerSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
@@ -655,6 +690,14 @@ bool ServerSession::connected() const {
 
 std::uint16_t ServerSession::local_id() const {
     return impl_ ? impl_->local_id : 0;
+}
+
+bool ServerSession::has_game_time() const {
+    return impl_ && impl_->has_game_time;
+}
+
+float ServerSession::game_time_fraction() const {
+    return impl_ ? impl_->game_time_fraction : 0.0f;
 }
 
 CharacterActionResult ServerSession::select_character(int slot, int timeout_ms) {
@@ -754,12 +797,22 @@ CharacterActionResult ServerSession::send_ingame_ack(int timeout_ms) {
     return result;
 }
 
+CharacterActionResult ServerSession::poll_frames(int max_frames) {
+    CharacterActionResult result;
+    if (!connected()) {
+        result.message = "character session is closed";
+        return result;
+    }
+    read_available_frames(impl_->socket.get(), result, (std::max)(1, max_frames));
+    result.ok = true;
+    return result;
+}
+
 bool ServerSession::send_position(double x, double y, double z, double angle, std::string& error) {
     if (!connected()) {
         error = "character session is closed";
         return false;
     }
-    drain_available_frames(impl_->socket.get());
     const auto packet = build_position_packet(impl_->local_id, ++impl_->position_sequence, x, y, z, angle);
     if (!send_all(impl_->socket.get(), packet)) {
         error = wsa_error_text("position send failed");
@@ -826,6 +879,9 @@ LoginProbeResult probe_login_server(
     if (recv_frame(socket, next_frame, timeout_ms)) {
         result.next_length = static_cast<int>(next_frame.size());
         result.next_opcode = read_u16le(next_frame, 2);
+        result.has_game_time = decode_server_credentials_time(next_frame, result.game_time_fraction);
+        session_impl->has_game_time = result.has_game_time;
+        session_impl->game_time_fraction = result.game_time_fraction;
     }
 
     if (result.next_opcode == 300 && next_frame.size() >= 13 && !login.empty() && !password.empty()) {
