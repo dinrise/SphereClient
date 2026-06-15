@@ -3268,12 +3268,12 @@ bool enter_game_mode(HWND hwnd, const PostedCharacterActionResult& posted) {
         return false;
     }
     auto scene = std::make_unique<sphere::client::GameWorldScene>();
-    const auto player_mesh = g_app->character_scene
-        ? g_app->character_scene->character_render_mesh()
-        : sphere::client::CharacterRenderMesh{};
-    if (!player_mesh.valid()) {
-        append_client_log(L"enter_game_mode: selected character render mesh is unavailable");
-        set_status(hwnd, L"Selected character render mesh is unavailable");
+    const auto player_model = g_app->character_scene
+        ? g_app->character_scene->skinned_model()
+        : sphere::client::SkinnedCharacterModel{};
+    if (!player_model.valid()) {
+        append_client_log(L"enter_game_mode: selected character skinned model is unavailable");
+        set_status(hwnd, L"Selected character model is unavailable");
         return false;
     }
     std::wstring error;
@@ -3283,7 +3283,7 @@ bool enter_game_mode(HWND hwnd, const PostedCharacterActionResult& posted) {
             hwnd,
             g_app->settings.root,
             world_config,
-            &player_mesh,
+            &player_model,
             world.x,
             -world.y,
             -world.z,
@@ -3322,7 +3322,25 @@ bool enter_game_mode(HWND hwnd, const PostedCharacterActionResult& posted) {
     return true;
 }
 
+// Debug-only: build a player render mesh from a transient character-select
+// scene so that --debug-game-world shows the first-person body without a live
+// server. The mesh is CPU-side data and outlives the transient scene/device.
+sphere::client::SkinnedCharacterModel build_debug_player_model(HWND hwnd) {
+    auto scene = std::make_unique<sphere::client::CharacterSelectScene>();
+    scene->set_camera_profiles(g_app->lua_boot.appearance.camera_profiles);
+    std::wstring error;
+    if (!scene->initialize(hwnd, g_app->settings.root, error)) {
+        append_client_log(L"build_debug_player_model: scene init failed: " + error);
+        return {};
+    }
+    if (!scene->set_character_appearance(false, 0, 0, 0, 0, error)) {
+        append_client_log(L"build_debug_player_model: appearance failed: " + error);
+    }
+    return scene->skinned_model();
+}
+
 bool enter_debug_game_mode(HWND hwnd) {
+    const auto debug_player_model = build_debug_player_model(hwnd);
     auto scene = std::make_unique<sphere::client::GameWorldScene>();
     std::wstring error;
     auto world_config = g_app->lua_boot.game_window;
@@ -3331,7 +3349,7 @@ bool enter_debug_game_mode(HWND hwnd) {
             hwnd,
             g_app->settings.root,
             world_config,
-            nullptr,
+            debug_player_model.valid() ? &debug_player_model : nullptr,
             g_app->settings.debug_game_x,
             g_app->settings.debug_game_y,
             g_app->settings.debug_game_z,

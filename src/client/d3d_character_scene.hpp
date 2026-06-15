@@ -9,6 +9,7 @@
 
 #include "client/character_camera.hpp"
 #include "client/character_render_mesh.hpp"
+#include "client/skinned_character.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -31,6 +32,7 @@ public:
     bool set_character_gender(bool female, std::wstring& error);
     bool set_character_appearance(bool female, int face, int hair, int hair_color, int tattoo, std::wstring& error);
     CharacterRenderMesh character_render_mesh() const;
+    SkinnedCharacterModel skinned_model() const;
     void set_camera_focus(int focus_id);
     void rotate_character(float radians_delta);
     void resize();

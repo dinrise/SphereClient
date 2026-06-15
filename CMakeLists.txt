@@ -124,6 +124,7 @@ if(WIN32)
         src/client/lua_runtime.cpp
         src/client/main.cpp
         src/client/network_client.cpp
+        src/client/skinned_character.cpp
         src/client/ui_definition.cpp
     )
     target_link_libraries(sphere_client PRIVATE newclient_common newclient_model lua55 user32 gdi32 msimg32 shell32 ws2_32 winmm d3d9)

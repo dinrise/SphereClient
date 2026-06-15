@@ -9,6 +9,7 @@
 
 #include "client/character_render_mesh.hpp"
 #include "client/lua_runtime.hpp"
+#include "client/skinned_character.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -44,7 +45,7 @@ public:
         HWND hwnd,
         const std::filesystem::path& root,
         const LuaGameWindowConfig& config,
-        const CharacterRenderMesh* player_mesh,
+        const SkinnedCharacterModel* player_model,
         double spawn_x,
         double spawn_y,
         double spawn_z,

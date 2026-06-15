@@ -1,5 +1,6 @@
 #include "client/d3d_game_world_scene.hpp"
 
+#include "client/skinned_character.hpp"
 #include "common/binary_reader.hpp"
 #include "model/mdl.hpp"
 
@@ -31,6 +32,16 @@ constexpr std::size_t kLndHeaderBytes = 0x68c0;
 constexpr std::size_t kLndVertexBytes = 40;
 constexpr std::size_t kLndTriangleBytes = 28;
 constexpr float kPi = 3.14159265358979323846f;
+// SKL "free"/idle action used while the player stands still. Other action
+// indices are selected by movement state (see update_player_animation).
+constexpr std::size_t kPlayerIdleAction = 20;
+constexpr float kPlayerAnimSecondsPerFrame = 0.08f; // matches character-select 80ms/frame
+// First-person eye placement, in world units (model ~2.05 tall, +y down).
+// The eye sits just below the crown of the skinned body (so it lands at eye
+// level and the near clip plane culls the player's own head), nudged forward
+// toward the face front.
+constexpr float kEyeBelowCrownWorld = 0.16f;  // distance down from the crown
+constexpr float kEyeForwardModel = 0.18f;      // toward the face front (model +z)
 
 struct WorldVertex {
     float x;
@@ -89,6 +100,7 @@ struct PlayerBatch {
     UINT start_index = 0;
     UINT index_count = 0;
     IDirect3DTexture9* texture = nullptr;
+    bool is_head = false;
 };
 
 struct StaticModelResource {
@@ -585,6 +597,18 @@ struct GameWorldScene::Impl {
     std::unordered_set<std::uint64_t> grass_cells;
     std::vector<PlayerBatch> player_batches;
     UINT player_vertex_count = 0;
+    // Animated first-person body.
+    SkinnedCharacterModel player_model;
+    std::vector<float> player_skin_scratch;
+    std::vector<WorldVertex> player_vertex_scratch;
+    std::size_t player_action = kPlayerIdleAction;
+    float player_anim_time = 0.0f;
+    int player_head_bone = -1;
+    bool player_eye_valid = false;
+    bool player_eye_initialized = false;
+    float player_eye_local_x = 0.0f;
+    float player_eye_local_y = 0.0f;
+    float player_eye_local_z = 0.0f;
     float spawn_x = 0.0f;
     float spawn_y = 0.0f;
     float spawn_z = 0.0f;
@@ -655,35 +679,90 @@ struct GameWorldScene::Impl {
         initialized = false;
     }
 
-    void load_player_mesh(const CharacterRenderMesh& mesh) {
-        if (!mesh.valid()) {
-            throw std::runtime_error("selected player render mesh is empty");
+    // Resolve the local skinned frame buffer for the current action/time and
+    // upload it into the player vertex buffer. Also caches the head-bone
+    // position so the first-person camera can ride at eye height.
+    void skin_player_frame() {
+        if (!player_model.valid() || !player_vertex_buffer) {
+            return;
+        }
+        const std::size_t action = player_action < player_model.action_count()
+            ? player_action
+            : kPlayerIdleAction;
+        const std::size_t action_start = player_model.action_frame_start(action);
+        const std::size_t action_frames = player_model.action_frame_count(action);
+        if (action_frames == 0) {
+            return;
+        }
+        const std::size_t local_frame =
+            static_cast<std::size_t>(player_anim_time / kPlayerAnimSecondsPerFrame) % action_frames;
+        const std::size_t frame = action_start + local_frame;
+
+        try {
+            skin_frame(player_model, frame, player_skin_scratch);
+        } catch (...) {
+            return;
         }
 
-        std::vector<WorldVertex> vertices;
-        vertices.reserve(mesh.vertices.size());
-        for (const auto& source : mesh.vertices) {
-            const auto normal = normalize(Vec3{source.nx, -source.ny, source.nz});
-            vertices.push_back(WorldVertex{
-                source.x,
-                -source.y,
-                source.z,
-                normal.x,
-                normal.y,
-                normal.z,
+        const std::size_t vertex_count = player_skin_scratch.size() / 8;
+        player_vertex_scratch.resize(vertex_count);
+        float crown_world_y = 0.0f; // smallest y == highest point (world +y down)
+        for (std::size_t i = 0; i < vertex_count; ++i) {
+            const float* s = player_skin_scratch.data() + i * 8;
+            // skin_frame emits character-select space (+y up); the world uses
+            // +y down, so flip y on both position and normal, matching the
+            // original static export path.
+            const float wy = -s[1];
+            if (i == 0 || wy < crown_world_y) {
+                crown_world_y = wy;
+            }
+            player_vertex_scratch[i] = WorldVertex{
+                s[0], wy, s[2],
+                s[3], -s[4], s[5],
                 0xffffffff,
-                source.u,
-                source.v,
-                source.u,
-                source.v,
-            });
+                s[6], s[7],
+                s[6], s[7],
+            };
         }
 
-        for (const auto& source : mesh.batches) {
+        const UINT vertex_bytes = static_cast<UINT>(vertex_count * sizeof(WorldVertex));
+        void* vertex_data = nullptr;
+        if (SUCCEEDED(player_vertex_buffer->Lock(0, vertex_bytes, &vertex_data, 0))) {
+            std::memcpy(vertex_data, player_vertex_scratch.data(), vertex_bytes);
+            player_vertex_buffer->Unlock();
+        }
+
+        // Ride the eye just below the crown of the skinned body. The bone
+        // translations in this rig are not bone world positions, so the body's
+        // own vertical extent is the reliable reference for eye height.
+        // Lock the eye height to the first skinned frame so idle body motion
+        // (breathing) does not bob the camera; movement bob is added separately.
+        if (!player_eye_initialized) {
+            player_eye_local_x = 0.0f;
+            player_eye_local_y = crown_world_y + kEyeBelowCrownWorld;
+            player_eye_local_z = kEyeForwardModel;
+            player_eye_valid = true;
+            player_eye_initialized = true;
+        }
+    }
+
+    void load_player_model(const SkinnedCharacterModel& model) {
+        if (!model.valid()) {
+            throw std::runtime_error("selected player skinned model is empty");
+        }
+        player_model = model;
+        player_head_bone = player_model.bone_index("head1");
+        if (player_head_bone < 0) {
+            player_head_bone = player_model.bone_index("head");
+        }
+        player_action = kPlayerIdleAction;
+        player_anim_time = 0.0f;
+
+        for (const auto& source : player_model.batches) {
             if (source.index_count < 3 ||
-                source.start_index > mesh.indices.size() ||
-                source.index_count > mesh.indices.size() - source.start_index) {
-                throw std::runtime_error("selected player render mesh contains an invalid material batch");
+                source.start_index > player_model.indices.size() ||
+                source.index_count > player_model.indices.size() - source.start_index) {
+                throw std::runtime_error("selected player model contains an invalid material batch");
             }
             if (!std::filesystem::exists(source.texture_path)) {
                 throw std::runtime_error("selected player texture is missing: " + source.texture_path.string());
@@ -692,11 +771,12 @@ struct GameWorldScene::Impl {
                 source.start_index,
                 source.index_count,
                 load_dds_texture(device, source.texture_path),
+                source.is_head,
             });
         }
 
-        player_vertex_count = static_cast<UINT>(vertices.size());
-        const UINT vertex_bytes = static_cast<UINT>(vertices.size() * sizeof(WorldVertex));
+        player_vertex_count = static_cast<UINT>(player_model.sources.size());
+        const UINT vertex_bytes = static_cast<UINT>(player_model.sources.size() * sizeof(WorldVertex));
         HRESULT hr = device->CreateVertexBuffer(
             vertex_bytes,
             0,
@@ -707,15 +787,8 @@ struct GameWorldScene::Impl {
         if (FAILED(hr)) {
             throw std::runtime_error(hresult_text_narrow("CreateVertexBuffer player", hr));
         }
-        void* vertex_data = nullptr;
-        hr = player_vertex_buffer->Lock(0, vertex_bytes, &vertex_data, 0);
-        if (FAILED(hr)) {
-            throw std::runtime_error(hresult_text_narrow("PlayerVertexBuffer::Lock", hr));
-        }
-        std::memcpy(vertex_data, vertices.data(), vertex_bytes);
-        player_vertex_buffer->Unlock();
 
-        const UINT index_bytes = static_cast<UINT>(mesh.indices.size() * sizeof(std::uint16_t));
+        const UINT index_bytes = static_cast<UINT>(player_model.indices.size() * sizeof(std::uint16_t));
         hr = device->CreateIndexBuffer(
             index_bytes,
             0,
@@ -731,8 +804,30 @@ struct GameWorldScene::Impl {
         if (FAILED(hr)) {
             throw std::runtime_error(hresult_text_narrow("PlayerIndexBuffer::Lock", hr));
         }
-        std::memcpy(index_data, mesh.indices.data(), index_bytes);
+        std::memcpy(index_data, player_model.indices.data(), index_bytes);
         player_index_buffer->Unlock();
+
+        // Skin the first frame so the body and eye height are valid immediately.
+        skin_player_frame();
+    }
+
+    void update_player_animation(float delta_seconds, bool moving, bool running) {
+        if (!player_model.valid()) {
+            return;
+        }
+        // Action by movement state, using SKL indices carried on the model
+        // (read from the original params\<model>.cfg: FREE/WALK/RUN). Until the
+        // per-model params reader is wired these default to idle.
+        const std::size_t desired = !moving
+            ? static_cast<std::size_t>(player_model.anim_idle)
+            : (running ? static_cast<std::size_t>(player_model.anim_run)
+                       : static_cast<std::size_t>(player_model.anim_walk));
+        if (desired != player_action) {
+            player_action = desired;
+            player_anim_time = 0.0f; // restart the cycle when the action changes
+        }
+        player_anim_time += (std::max)(0.0f, delta_seconds);
+        skin_player_frame();
     }
 
     RECT client_rect() const {
@@ -1635,7 +1730,17 @@ struct GameWorldScene::Impl {
         const float aspect = static_cast<float>(rc.right - rc.left) / static_cast<float>(rc.bottom - rc.top);
         // Sphere's renderer uses positive Y downward; the server/Godot side
         // stores the same position with the Y sign reversed.
-        const Vec3 eye{spawn_x, spawn_y - config.camera_eye_height, spawn_z};
+        // The first-person camera rides at the player's head bone (so the body
+        // is visible below and the near clip culls the player's own head),
+        // falling back to a fixed eye height before the model is skinned.
+        Vec3 eye{spawn_x, spawn_y - config.camera_eye_height, spawn_z};
+        if (player_eye_valid) {
+            const float c = std::cos(spawn_angle);
+            const float s = std::sin(spawn_angle);
+            eye.x = spawn_x + player_eye_local_x * c + player_eye_local_z * s;
+            eye.y = spawn_y + player_eye_local_y;
+            eye.z = spawn_z - player_eye_local_x * s + player_eye_local_z * c;
+        }
         const float horizontal_distance = std::cos(camera_pitch) * config.camera_look_distance;
         const Vec3 target{
             eye.x + std::sin(camera_yaw) * horizontal_distance,
@@ -1824,6 +1929,9 @@ struct GameWorldScene::Impl {
         device->SetFVF(kWorldVertexFvf);
         device->SetStreamSource(0, player_vertex_buffer, 0, sizeof(WorldVertex));
         device->SetIndices(player_index_buffer);
+        // Backface-cull the body so looking down does not reveal the dark
+        // interior of the torso/neck. The rest of the world draws double-sided.
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
         for (const auto& batch : player_batches) {
             device->SetTexture(0, batch.texture);
             device->DrawIndexedPrimitive(
@@ -1834,6 +1942,7 @@ struct GameWorldScene::Impl {
                 batch.start_index,
                 batch.index_count / 3);
         }
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     }
 
     void draw_overlay() {
@@ -1872,7 +1981,7 @@ struct GameWorldScene::Impl {
         HWND window,
         const std::filesystem::path& root,
         const LuaGameWindowConfig& world_config,
-        const CharacterRenderMesh* player_mesh,
+        const SkinnedCharacterModel* player_model_in,
         double x,
         double y,
         double z,
@@ -1903,8 +2012,8 @@ struct GameWorldScene::Impl {
             load_visible_grass();
             load_static_placements();
             load_visible_static_objects();
-            if (player_mesh) {
-                load_player_mesh(*player_mesh);
+            if (player_model_in) {
+                load_player_model(*player_model_in);
             }
         } catch (const std::exception& ex) {
             assign_error(error, std::string("game world load failed: ") + ex.what());
@@ -2039,6 +2148,7 @@ struct GameWorldScene::Impl {
         const float forward = (input.forward ? 1.0f : 0.0f) - (input.backward ? 1.0f : 0.0f);
         const float right = (input.strafe_right ? 1.0f : 0.0f) - (input.strafe_left ? 1.0f : 0.0f);
         const float input_length = std::sqrt(forward * forward + right * right);
+        update_player_animation(delta_seconds, input_length > 0.0001f, input.run);
         if (input_length <= 0.0001f || delta_seconds <= 0.0f) {
             return true;
         }
@@ -2153,6 +2263,7 @@ struct GameWorldScene::Impl {
             draw_terrain();
             draw_grass();
             draw_static_objects();
+            draw_player();
             draw_overlay();
             device->EndScene();
         }
@@ -2167,13 +2278,13 @@ bool GameWorldScene::initialize(
     HWND hwnd,
     const std::filesystem::path& root,
     const LuaGameWindowConfig& config,
-    const CharacterRenderMesh* player_mesh,
+    const SkinnedCharacterModel* player_model,
     double spawn_x,
     double spawn_y,
     double spawn_z,
     double spawn_angle,
     std::wstring& error) {
-    return impl_->initialize(hwnd, root, config, player_mesh, spawn_x, spawn_y, spawn_z, spawn_angle, error);
+    return impl_->initialize(hwnd, root, config, player_model, spawn_x, spawn_y, spawn_z, spawn_angle, error);
 }
 
 bool GameWorldScene::set_overlay_bitmap(int width, int height, std::vector<std::uint8_t> bgra_pixels, std::wstring& error) {

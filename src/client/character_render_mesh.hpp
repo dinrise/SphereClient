@@ -21,6 +21,9 @@ struct CharacterRenderBatch {
     std::uint32_t start_index = 0;
     std::uint32_t index_count = 0;
     std::filesystem::path texture_path;
+    // Face/hair subobjects. Hidden when the local player is drawn in
+    // first-person so the camera does not look at its own head.
+    bool is_head = false;
 };
 
 struct CharacterRenderMesh {

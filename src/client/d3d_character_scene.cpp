@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -75,6 +76,7 @@ struct SceneBatch {
     std::filesystem::path texture_path;
     IDirect3DTexture9* texture = nullptr;
     bool sky = false;
+    bool is_head = false;
 };
 
 struct Matrix4 {
@@ -1002,6 +1004,12 @@ struct CharacterSelectScene::Impl {
         };
         const auto subobjects = load_xadd_subobjects(root / "xadd" / "subobjs.dat");
         const auto codes = character_subobject_codes(female, face, hair);
+        // The last two subobject codes are the face and hair meshes (the head).
+        std::set<std::string> head_codes;
+        if (codes.size() >= 2) {
+            head_codes.insert(codes[codes.size() - 1]);
+            head_codes.insert(codes[codes.size() - 2]);
+        }
 
         vertices.clear();
         indices.clear();
@@ -1095,6 +1103,7 @@ struct CharacterSelectScene::Impl {
                 texture_path,
                 nullptr,
                 false,
+                head_codes.count(code) != 0,
             });
         }
 
@@ -1501,6 +1510,43 @@ struct CharacterSelectScene::Impl {
                 batch.start_index,
                 batch.index_count,
                 batch.texture_path,
+                batch.is_head,
+            });
+        }
+        return out;
+    }
+
+    SkinnedCharacterModel skinned_model() const {
+        SkinnedCharacterModel out;
+        out.skeleton = character_skeleton;
+        out.scale = character_scale;
+        out.center_x = character_center_x;
+        out.center_z = character_center_z;
+        out.min_y = character_min_y;
+        out.indices = indices;
+        out.sources.reserve(character_sources.size());
+        for (const auto& source : character_sources) {
+            out.sources.push_back(SkinnedSource{
+                source.position.x,
+                source.position.y,
+                source.position.z,
+                source.normal.x,
+                source.normal.y,
+                source.normal.z,
+                source.u,
+                source.v,
+                source.bone0,
+                source.bone1,
+                source.blend,
+            });
+        }
+        out.batches.reserve(character_batches.size());
+        for (const auto& batch : character_batches) {
+            out.batches.push_back(SkinnedBatch{
+                batch.start_index,
+                batch.index_count,
+                batch.texture_path,
+                batch.is_head,
             });
         }
         return out;
@@ -1804,6 +1850,10 @@ bool CharacterSelectScene::set_character_appearance(bool female, int face, int h
 
 CharacterRenderMesh CharacterSelectScene::character_render_mesh() const {
     return impl_->character_render_mesh();
+}
+
+SkinnedCharacterModel CharacterSelectScene::skinned_model() const {
+    return impl_->skinned_model();
 }
 
 void CharacterSelectScene::set_camera_focus(int focus_id) {
