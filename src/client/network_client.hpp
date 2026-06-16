@@ -84,6 +84,7 @@ public:
     std::uint16_t local_id() const;
     bool has_game_time() const;
     float game_time_fraction() const;
+    void game_date(int& day, int& month, int& year) const;
 
 private:
     struct Impl;
@@ -112,6 +113,9 @@ struct LoginProbeResult {
     std::uint16_t local_id = 0;
     bool has_game_time = false;
     float game_time_fraction = 0.0f;
+    int game_day = 0;
+    int game_month = 0;
+    int game_year = 0;
     int character_select_packets = 0;
     int character_select_bytes = 0;
     std::shared_ptr<ServerSession> session;

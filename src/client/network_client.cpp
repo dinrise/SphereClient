@@ -649,7 +649,17 @@ void read_available_frames(SOCKET socket, CharacterActionResult& result, int max
     }
 }
 
-bool decode_server_credentials_time(const std::vector<std::uint8_t>& frame, float& fraction) {
+// Decode the in-game date/time from the server credentials (opcode 300) packet.
+// Layout is the inverse of SphServer TimeHelper.EncodeCurrentSphereDateTime:
+//   frame[13] = (minute&0x0f)<<4 | (second/12+1)
+//   frame[14] = (day&1)<<7 | hour<<2 | (minute>>4)&0x03
+//   frame[15] = month<<4 | (day>>1)&0x0f
+//   frame[16] = year & 0xff
+//   frame[17] = 0x34 | ((year>>8)&0x03)
+// The raw year is the .NET DateTime year (~334); the client displays it +7800
+// (matches the original client's "...8134" and the project's PacketLogViewer).
+bool decode_server_credentials_time(const std::vector<std::uint8_t>& frame, float& fraction,
+                                    int& day, int& month, int& year) {
     if (frame.size() != 56 || read_u16le(frame, 2) != 300 ||
         frame[9] != 0x08 || frame[10] != 0x40 || frame[11] != 0x20 || frame[12] != 0x10) {
         return false;
@@ -661,6 +671,9 @@ bool decode_server_credentials_time(const std::vector<std::uint8_t>& frame, floa
         return false;
     }
     fraction = static_cast<float>(hours * 3600 + minutes * 60 + seconds) / 86400.0f;
+    day = ((frame[15] & 0x0f) << 1) | ((frame[14] >> 7) & 0x01);
+    month = (frame[15] >> 4) & 0x0f;
+    year = ((((frame[17] & 0x03) << 8) | frame[16]) + 7800);
     return true;
 }
 
@@ -677,6 +690,9 @@ struct ServerSession::Impl {
     std::uint8_t position_sequence = 0;
     bool has_game_time = false;
     float game_time_fraction = 0.0f;
+    int game_day = 0;
+    int game_month = 0;
+    int game_year = 0;
 };
 
 ServerSession::ServerSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
@@ -698,6 +714,12 @@ bool ServerSession::has_game_time() const {
 
 float ServerSession::game_time_fraction() const {
     return impl_ ? impl_->game_time_fraction : 0.0f;
+}
+
+void ServerSession::game_date(int& day, int& month, int& year) const {
+    day = impl_ ? impl_->game_day : 0;
+    month = impl_ ? impl_->game_month : 0;
+    year = impl_ ? impl_->game_year : 0;
 }
 
 CharacterActionResult ServerSession::select_character(int slot, int timeout_ms) {
@@ -879,9 +901,13 @@ LoginProbeResult probe_login_server(
     if (recv_frame(socket, next_frame, timeout_ms)) {
         result.next_length = static_cast<int>(next_frame.size());
         result.next_opcode = read_u16le(next_frame, 2);
-        result.has_game_time = decode_server_credentials_time(next_frame, result.game_time_fraction);
+        result.has_game_time = decode_server_credentials_time(
+            next_frame, result.game_time_fraction, result.game_day, result.game_month, result.game_year);
         session_impl->has_game_time = result.has_game_time;
         session_impl->game_time_fraction = result.game_time_fraction;
+        session_impl->game_day = result.game_day;
+        session_impl->game_month = result.game_month;
+        session_impl->game_year = result.game_year;
     }
 
     if (result.next_opcode == 300 && next_frame.size() >= 13 && !login.empty() && !password.empty()) {

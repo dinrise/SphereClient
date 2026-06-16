@@ -49,6 +49,12 @@ constexpr float kMoveBodyBackShift = 0.5f;
 // the walk/run cycle (as the original's head-attached camera does), giving a
 // small up/down sway. Idle keeps the eye locked. No start/stop offset.
 constexpr float kWalkBobScale = 1.0f;
+// Jump: ControlMove sets the player's vertical velocity field (0x28C) to -5
+// (up; world +y is down) when the jump key is pressed on the ground. Gravity is
+// applied engine-side; its exact constant is not in the scripts, so this value
+// is tuned to a natural hop and may be refined against Ghidra.
+constexpr float kJumpImpulse = -5.0f;
+constexpr float kJumpGravity = 20.0f;
 
 struct WorldVertex {
     float x;
@@ -622,6 +628,8 @@ struct GameWorldScene::Impl {
     float player_eye_local_z = 0.0f;
     float spawn_x = 0.0f;
     float spawn_y = 0.0f;
+    float velocity_y = 0.0f; // vertical velocity for jump/gravity (world +y down)
+    bool grounded = true;
     float spawn_z = 0.0f;
     float spawn_angle = 0.0f;
     float camera_yaw = 0.0f;
@@ -1731,15 +1739,47 @@ struct GameWorldScene::Impl {
 
     bool try_move_to(float x, float z) {
         float ground_y = 0.0f;
-        if (!terrain_height_at(x, z, spawn_y, ground_y) ||
-            std::abs(ground_y - spawn_y) > config.max_step_height ||
-            collides_with_static(x, ground_y, z)) {
+        if (!terrain_height_at(x, z, spawn_y, ground_y)) {
             return false;
         }
-        spawn_x = x;
-        spawn_y = ground_y;
-        spawn_z = z;
+        if (grounded) {
+            if (std::abs(ground_y - spawn_y) > config.max_step_height ||
+                collides_with_static(x, ground_y, z)) {
+                return false;
+            }
+            spawn_x = x;
+            spawn_y = ground_y;
+            spawn_z = z;
+        } else {
+            // Airborne: keep the jump-controlled height, just move horizontally.
+            if (collides_with_static(x, spawn_y, z)) {
+                return false;
+            }
+            spawn_x = x;
+            spawn_z = z;
+        }
         return true;
+    }
+
+    void jump() {
+        if (grounded) {
+            velocity_y = kJumpImpulse;
+            grounded = false;
+        }
+    }
+
+    void update_vertical(float delta_seconds) {
+        if (grounded || delta_seconds <= 0.0f) {
+            return;
+        }
+        velocity_y += kJumpGravity * delta_seconds;
+        spawn_y += velocity_y * delta_seconds;
+        float ground_y = 0.0f;
+        if (terrain_height_at(spawn_x, spawn_z, spawn_y, ground_y) && spawn_y >= ground_y) {
+            spawn_y = ground_y;
+            velocity_y = 0.0f;
+            grounded = true;
+        }
     }
 
     void update_view_projection() {
@@ -2177,6 +2217,7 @@ struct GameWorldScene::Impl {
         const float right = (input.strafe_right ? 1.0f : 0.0f) - (input.strafe_left ? 1.0f : 0.0f);
         const float input_length = std::sqrt(forward * forward + right * right);
         update_player_animation(delta_seconds, input_length > 0.0001f, input.run);
+        update_vertical(delta_seconds);
         if (input_length <= 0.0001f || delta_seconds <= 0.0f) {
             return true;
         }
@@ -2327,12 +2368,24 @@ void GameWorldScene::set_game_time(float day_fraction) {
     impl_->set_game_time(day_fraction);
 }
 
+float GameWorldScene::current_game_time() const {
+    return impl_ ? impl_->game_time_fraction : 0.0f;
+}
+
+float GameWorldScene::camera_facing() const {
+    return impl_ ? impl_->camera_yaw : 0.0f;
+}
+
 bool GameWorldScene::update(float delta_seconds, const GameMovementInput& input, std::wstring& error) {
     return impl_->update(delta_seconds, input, error);
 }
 
 void GameWorldScene::rotate_view(float mouse_dx, float mouse_dy) {
     impl_->rotate_view(mouse_dx, mouse_dy);
+}
+
+void GameWorldScene::jump() {
+    impl_->jump();
 }
 
 GameWorldPosition GameWorldScene::position() const {

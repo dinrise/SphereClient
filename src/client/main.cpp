@@ -14,6 +14,7 @@
 #include "client/ui_definition.hpp"
 #include "common/binary_reader.hpp"
 #include "common/config.hpp"
+#include "common/sys_messages.hpp"
 
 #include <algorithm>
 #include <array>
@@ -89,6 +90,23 @@ struct ClientSettings {
     int scan_strafe_right = 32;
     int key_cursor = VK_TAB;
     int key_run = 'R';
+    // Window/action hotkeys (VK codes) and jump (scan code), from control.cfg.
+    // Defaults match the original control.cfg.
+    int scan_jump = 57;     // CodeJUMP (Space scancode)
+    int key_inv = 'I';      // KeyINV
+    int key_macr = 'K';     // KeyMACR (cycle quickitems/hotkeys)
+    int key_stat = 'H';     // KeySTAT
+    int key_trade = 'T';    // KeyTRADE
+    int key_clan = 'N';     // KeyCLAN
+    int key_puppet = 'P';   // KeyPUPPET
+    int key_map = 'M';      // KeyMAP
+    int key_diary = 'J';    // KeyDIARY
+    int key_mantra = 'O';   // KeyMANTRA
+    int key_alch = 'Y';     // KeyALCH
+    int key_grp = 'G';      // KeyGRP
+    int key_chat = 191;     // KeyCHAT
+    int key_fist = 192;     // KeyFIST
+    int key_off = 189;      // KeyOFF
     bool always_run = true;
     std::string registration_url;
     bool debug_auto_enter = false;
@@ -200,8 +218,14 @@ struct AppState {
     ULONGLONG game_last_tick = 0;
     ULONGLONG game_last_position_send_tick = 0;
     ULONGLONG game_last_overlay_tick = 0;
+    int game_last_clock_second = -1;
+    float game_last_compass_facing = 1e9f;
     bool has_game_time = false;
     float game_time_fraction = 0.0f;
+    int game_day = 0;
+    int game_month = 0;
+    int game_year = 0;
+    sphere::msg::MessageGroup sys_messages;  // language\_sys.txt (gMsg group)
     GameWorldState game_world;
     std::wstring status;
 };
@@ -610,6 +634,21 @@ ClientSettings load_settings() {
     settings.scan_strafe_right = control.get_int("CodeSRIGHT", settings.scan_strafe_right);
     settings.key_cursor = control.get_int("KeyCURS", settings.key_cursor);
     settings.key_run = control.get_int("KeyRUN", settings.key_run);
+    settings.scan_jump = control.get_int("CodeJUMP", settings.scan_jump);
+    settings.key_inv = control.get_int("KeyINV", settings.key_inv);
+    settings.key_macr = control.get_int("KeyMACR", settings.key_macr);
+    settings.key_stat = control.get_int("KeySTAT", settings.key_stat);
+    settings.key_trade = control.get_int("KeyTRADE", settings.key_trade);
+    settings.key_clan = control.get_int("KeyCLAN", settings.key_clan);
+    settings.key_puppet = control.get_int("KeyPUPPET", settings.key_puppet);
+    settings.key_map = control.get_int("KeyMAP", settings.key_map);
+    settings.key_diary = control.get_int("KeyDIARY", settings.key_diary);
+    settings.key_mantra = control.get_int("KeyMANTRA", settings.key_mantra);
+    settings.key_alch = control.get_int("KeyALCH", settings.key_alch);
+    settings.key_grp = control.get_int("KeyGRP", settings.key_grp);
+    settings.key_chat = control.get_int("KeyCHAT", settings.key_chat);
+    settings.key_fist = control.get_int("KeyFIST", settings.key_fist);
+    settings.key_off = control.get_int("KeyOFF", settings.key_off);
     settings.always_run = control.get_int("ALWRUN", settings.always_run ? 1 : 0) != 0;
 
     try {
@@ -1316,6 +1355,107 @@ void draw_sprite_from_window(HDC dc, const sphere::client::UiWindowDef& window, 
     }
 }
 
+// Draw a single-piece sprite rotated clockwise by angle_deg about the centre of
+// rc. Used for the system_right analog clock hands, which the original rotates
+// via window_api(25, ctrl, 2602, angle) about the dial centre (the hand controls
+// are positioned so their rect centre coincides with the clk_clip centre).
+// angle_deg == 0 leaves the hand pointing up (12 o'clock); positive is clockwise.
+void draw_sprite_rotated_centered(HDC dc, const sphere::client::UiWindowDef& window,
+                                  const std::wstring& sprite_name, RECT rc, float angle_deg) {
+    const auto it = window.sprites.find(lowercase(sprite_name));
+    if (it == window.sprites.end() || it->second.pieces.empty()) {
+        return;
+    }
+    const auto& piece = it->second.pieces.front();
+    auto* texture = texture_for(piece.texture_name);
+    if (!texture || !*texture || !texture->pixels) {
+        return;
+    }
+    const int sx = piece.src_left;
+    const int sy = piece.src_top;
+    const int sw = piece.src_right - piece.src_left;
+    const int sh = piece.src_bottom - piece.src_top;
+    const int dw = rc.right - rc.left;  // control size: st_small stretched to the hand size
+    const int dh = rc.bottom - rc.top;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) {
+        return;
+    }
+    const double cx = (rc.left + rc.right) * 0.5;
+    const double cy = (rc.top + rc.bottom) * 0.5;
+    const int S = static_cast<int>(std::ceil(std::sqrt(double(dw) * dw + double(dh) * dh))) + 2;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = S;
+    info.bmiHeader.biHeight = -S;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bmp || !pixels) {
+        if (bmp) DeleteObject(bmp);
+        return;
+    }
+    auto* out = static_cast<std::uint8_t*>(pixels);
+    ZeroMemory(out, static_cast<std::size_t>(S) * S * 4);
+
+    const double theta = static_cast<double>(angle_deg) * 3.14159265358979323846 / 180.0;
+    const double ct = std::cos(theta);
+    const double st = std::sin(theta);
+    const double half = (S - 1) * 0.5;
+    for (int yy = 0; yy < S; ++yy) {
+        for (int xx = 0; xx < S; ++xx) {
+            const double ox = xx - half;
+            const double oy = yy - half;
+            // Inverse of the clockwise (y-down) rotation matrix [ct -st; st ct].
+            const double lx = ct * ox + st * oy;
+            const double ly = -st * ox + ct * oy;
+            const double sxl = dw * 0.5 + lx;  // position within the stretched sprite
+            const double syl = dh * 0.5 + ly;
+            if (sxl < 0.0 || sxl >= dw || syl < 0.0 || syl >= dh) {
+                continue;
+            }
+            const int tu = std::clamp(sx + static_cast<int>(sxl / dw * sw), 0, texture->width - 1);
+            const int tv = std::clamp(sy + static_cast<int>(syl / dh * sh), 0, texture->height - 1);
+            const auto* src = texture->pixels + static_cast<std::size_t>(tv) * texture->stride + tu * 4;
+            auto* d = out + (static_cast<std::size_t>(yy) * S + xx) * 4;
+            d[0] = src[0];
+            d[1] = src[1];
+            d[2] = src[2];
+            d[3] = src[3];
+        }
+    }
+
+    HDC mem_dc = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(mem_dc, bmp);
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    AlphaBlend(dc, static_cast<int>(std::lround(cx - half)), static_cast<int>(std::lround(cy - half)),
+               S, S, mem_dc, 0, 0, S, S, blend);
+    SelectObject(mem_dc, old);
+    DeleteDC(mem_dc);
+    DeleteObject(bmp);
+}
+
+// Analog clock hand angle (degrees, clockwise from 12) from the in-game day
+// fraction, matching _pcontrol.local_000093FB:
+//   hour hand   (control 11): (hour/12 + minute/720) * 360
+//   minute hand (control 12): (minute/60 + second/240) * 360
+double clock_hand_angle(int control_id, float day_fraction) {
+    float frac = day_fraction - std::floor(day_fraction);
+    const int total = static_cast<int>(frac * 86400.0f) % 86400;
+    const int seconds = total % 60;
+    const int minutes = (total / 60) % 60;
+    const int hours = (total / 3600) % 24;
+    if (control_id == 11) {
+        return (hours / 12.0 + minutes / 720.0) * 360.0;
+    }
+    return (minutes / 60.0 + seconds / 240.0) * 360.0;
+}
+
 void draw_sprite(HDC dc, const std::wstring& sprite_name, int x, int y) {
     draw_sprite_from_window(dc, g_app->runtime.connection_window, sprite_name, x, y);
 }
@@ -1651,8 +1791,42 @@ std::wstring quality_text(int value, bool has_off) {
     return ui_string(keys[quality]);
 }
 
+// In-game date line for the system_right clock (control 2), matching
+// _pcontrol.local_000093FB: "<time-of-day> <day> <month> <year>", e.g.
+// "утро 2 ноя 8134". Time-of-day word from the current hour (gMsg 180+tod),
+// month name from gMsg(34+month), formatted with gMsg(33) = "%d %s %d".
+std::wstring game_clock_date_text() {
+    if (!g_app->has_game_time) {
+        return {};
+    }
+    const float frac = g_app->game_scene ? g_app->game_scene->current_game_time() : g_app->game_time_fraction;
+    const float f = frac - std::floor(frac);
+    const int hour = (static_cast<int>(f * 86400.0f) / 3600) % 24;
+    int tod = 0;  // night
+    if (hour >= 5 && hour < 8) tod = 1;        // morning
+    else if (hour >= 8 && hour < 19) tod = 2;  // day
+    else if (hour >= 19 && hour < 22) tod = 3; // evening
+
+    std::wstring result = g_app->sys_messages.get(180 + tod);
+    const std::wstring& date_fmt = g_app->sys_messages.get(33);
+    if (!date_fmt.empty() && g_app->game_month >= 1 && g_app->game_month <= 12) {
+        const std::wstring& month_name = g_app->sys_messages.get(34 + g_app->game_month);
+        wchar_t buf[128];
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE, date_fmt.c_str(),
+                     g_app->game_day, month_name.c_str(), g_app->game_year);
+        if (!result.empty()) {
+            result += L' ';
+        }
+        result += buf;
+    }
+    return result;
+}
+
 std::wstring game_control_text(const sphere::client::UiWindowDef& window, const sphere::client::UiControlDef& def) {
     const auto name = lowercase(window.name);
+    if (name == L"system_right" && def.id == 2) {
+        return game_clock_date_text();
+    }
     if (name == L"gfx_options") {
         switch (def.id) {
         case 7: {
@@ -1752,7 +1926,21 @@ void draw_game_control(HDC dc, const sphere::client::UiWindowDef& window, int wi
     RECT rc = game_control_rect(window_rect, def);
     if (class_is(def, L"Image")) {
         if (!def.image_name.empty()) {
-            draw_sprite_from_window(dc, window, def.image_name, rc.left, rc.top);
+            const std::wstring wname = lowercase(window.name);
+            // system_right clock hands (id 11 = hour, 12 = minute) rotate with the
+            // in-game time, matching _pcontrol.local_000093FB's window_api(25,..,2602,angle).
+            if (wname == L"system_right" && (def.id == 11 || def.id == 12) &&
+                g_app->has_game_time && g_app->game_scene) {
+                const double angle = clock_hand_angle(def.id, g_app->game_scene->current_game_time());
+                draw_sprite_rotated_centered(dc, window, def.image_name, rc, static_cast<float>(angle));
+            } else if (wname == L"system_left" && def.id == 11 && g_app->game_scene) {
+                // Compass needle ("kompas"): rotates with the player's heading, matching
+                // _pcontrol window_api(25, ctrl11, 2602, object_get_vec14_x(player)*180/pi).
+                const double angle = g_app->game_scene->camera_facing() * 57.29577951308232;
+                draw_sprite_rotated_centered(dc, window, def.image_name, rc, static_cast<float>(angle));
+            } else {
+                draw_sprite_from_window(dc, window, def.image_name, rc.left, rc.top);
+            }
         }
         return;
     }
@@ -2929,7 +3117,28 @@ void update_game_frame(HWND hwnd) {
         g_app->game_world.world_packet_count += incoming.packet_count;
         g_app->game_world.world_byte_count += incoming.byte_count;
     }
-    if (changed && now - g_app->game_last_overlay_tick >= 200) {
+    // The analog clock hands advance with the in-game time, so the overlay must
+    // be rebuilt as game-seconds tick (not only when the player moves).
+    bool clock_ticked = false;
+    if (g_app->has_game_time) {
+        const float frac = g_app->game_scene->current_game_time();
+        const int second = static_cast<int>((frac - std::floor(frac)) * 86400.0f) % 86400;
+        if (second != g_app->game_last_clock_second) {
+            g_app->game_last_clock_second = second;
+            clock_ticked = true;
+        }
+    }
+    // Rebuild the overlay when the heading changes too, so the compass needle tracks
+    // the view even when the player only rotates (position unchanged).
+    bool compass_turned = false;
+    {
+        const float facing = g_app->game_scene->camera_facing();
+        if (std::abs(facing - g_app->game_last_compass_facing) > 0.02f) {
+            g_app->game_last_compass_facing = facing;
+            compass_turned = true;
+        }
+    }
+    if ((changed || clock_ticked || compass_turned) && now - g_app->game_last_overlay_tick >= 200) {
         update_game_overlay(hwnd);
         g_app->game_last_overlay_tick = now;
     }
@@ -3122,6 +3331,9 @@ void enter_character_select_3d(HWND hwnd, const sphere::client::LoginProbeResult
     g_app->server_session = result.session;
     g_app->has_game_time = result.has_game_time;
     g_app->game_time_fraction = result.game_time_fraction;
+    g_app->game_day = result.game_day;
+    g_app->game_month = result.game_month;
+    g_app->game_year = result.game_year;
     g_app->character_slots = result.character_slots;
     g_app->selected_character_slot = first_selectable_character_slot(g_app->character_slots);
     for (int i = 0; i < 3; ++i) {
@@ -3995,6 +4207,46 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             if (set_game_movement_key(wparam, lparam, true)) {
                 return 0;
             }
+            const bool first_press = (lparam & (1LL << 30)) == 0;
+            const int vk = static_cast<int>(wparam);
+            const int scan_code = static_cast<int>((static_cast<unsigned long long>(lparam) >> 16) & 0xffU);
+            if (first_press && scan_code == g_app->settings.scan_jump && g_app->game_scene) {
+                g_app->game_scene->jump();
+                return 0;
+            }
+            // Window/action hotkeys, dispatched exactly like the original
+            // _pcontrol.WinManager (control.cfg keys -> window toggles).
+            if (first_press) {
+                struct KeyWindow { int key; const wchar_t* window; };
+                const KeyWindow key_windows[] = {
+                    {g_app->settings.key_inv, L"inventory"},
+                    {g_app->settings.key_stat, L"statinfo"},
+                    {g_app->settings.key_puppet, L"puppet"},
+                    {g_app->settings.key_clan, L"clan"},
+                    {g_app->settings.key_grp, L"group"},
+                    {g_app->settings.key_map, L"minimap"},
+                    {g_app->settings.key_diary, L"journal"},
+                    {g_app->settings.key_mantra, L"mantrabook"},
+                    {g_app->settings.key_trade, L"trade"},
+                };
+                for (const auto& kw : key_windows) {
+                    if (vk == kw.key) {
+                        toggle_game_window(kw.window);
+                        update_game_overlay(hwnd);
+                        return 0;
+                    }
+                }
+                if (vk == g_app->settings.key_macr) {
+                    toggle_game_window(L"hotkeys");
+                    update_game_overlay(hwnd);
+                    return 0;
+                }
+                if (vk == g_app->settings.key_chat || vk == VK_RETURN) {
+                    toggle_game_chat();
+                    update_game_overlay(hwnd);
+                    return 0;
+                }
+            }
             if (static_cast<int>(wparam) == g_app->settings.key_cursor) {
                 set_game_look_mode(hwnd, !g_app->game_look_mode);
             } else if (static_cast<int>(wparam) == g_app->settings.key_run && (lparam & (1LL << 30)) == 0) {
@@ -4154,6 +4406,7 @@ int run(HINSTANCE instance, int show_command) {
     state->settings = load_settings();
     load_saved_login(*state);
     state->runtime = sphere::client::load_client_runtime(state->settings.root, state->settings.lang, state->settings.connect_type);
+    state->sys_messages.load(state->settings.root / "language" / "_sys.txt");
     state->lua_runtime = std::make_unique<sphere::client::LuaRuntime>();
     state->lua_boot = state->lua_runtime->initialize(state->settings.root);
     state->pick_person_window = sphere::client::load_ui_window(state->settings.root / "effects" / "pickpers.ui");

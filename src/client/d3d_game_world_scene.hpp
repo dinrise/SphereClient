@@ -54,8 +54,11 @@ public:
     bool set_overlay_bitmap(int width, int height, std::vector<std::uint8_t> bgra_pixels, std::wstring& error);
     bool set_grass_quality(int quality, std::wstring& error);
     void set_game_time(float day_fraction);
+    float current_game_time() const;
+    float camera_facing() const;
     bool update(float delta_seconds, const GameMovementInput& input, std::wstring& error);
     void rotate_view(float mouse_dx, float mouse_dy);
+    void jump();
     GameWorldPosition position() const;
     void resize();
     void render();
