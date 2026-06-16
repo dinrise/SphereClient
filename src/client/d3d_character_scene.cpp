@@ -1,6 +1,7 @@
 #include "client/d3d_character_scene.hpp"
 
 #include "common/binary_reader.hpp"
+#include "common/params_config.hpp"
 #include "model/chr.hpp"
 #include "model/mdl.hpp"
 #include "model/skl.hpp"
@@ -636,6 +637,11 @@ struct CharacterSelectScene::Impl {
     float character_min_y = 0.0f;
     float character_center_z = 0.0f;
     float character_scale = 1.0f;
+    // Movement animation SKL indices, read from the player's params cfg
+    // (NumToModel: male=char04, female=char17). Default to idle until loaded.
+    int character_anim_idle = 20;
+    int character_anim_walk = 20;
+    int character_anim_run = 20;
     std::size_t character_animation_start = 0;
     std::size_t character_animation_frames = 1;
     DWORD character_animation_tick = 0;
@@ -1117,6 +1123,25 @@ struct CharacterSelectScene::Impl {
         const float span_y = max_y - min_y;
         character_scale = 2.05f / (std::max)(span_y, 0.001f);
         update_character_vertices_for_frame(character_animation_start);
+
+        load_player_animation_table(root, female);
+    }
+
+    // Reads the player's movement animation SKL indices from the original
+    // params cfg, exactly as _player.NumToModel selects it: male=char04,
+    // female=char17. Values stay data-driven (FREE/WALK/RUN), never hardcoded.
+    void load_player_animation_table(const std::filesystem::path& root, bool female) {
+        character_anim_idle = 20;
+        character_anim_walk = 20;
+        character_anim_run = 20;
+        sphere::params::Config cfg;
+        const auto path = root / "params" / (female ? "char17.cfg" : "char04.cfg");
+        if (!cfg.load(path)) {
+            return;
+        }
+        character_anim_idle = cfg.get_int_or("FREE", character_anim_idle);
+        character_anim_walk = cfg.get_int_or("WALK", character_anim_walk);
+        character_anim_run = cfg.get_int_or("RUN", character_anim_run);
     }
 
     void load_mdl_scene_mesh(const std::filesystem::path& root) {
@@ -1523,6 +1548,13 @@ struct CharacterSelectScene::Impl {
         out.center_x = character_center_x;
         out.center_z = character_center_z;
         out.min_y = character_min_y;
+        out.anim_idle = character_anim_idle;
+        out.anim_walk = character_anim_walk;
+        out.anim_run = character_anim_run;
+        out.root_bone = static_cast<int>(character_root_bone);
+        out.root_bind_x = character_root_bind_position.x;
+        out.root_bind_y = character_root_bind_position.y;
+        out.root_bind_z = character_root_bind_position.z;
         out.indices = indices;
         out.sources.reserve(character_sources.size());
         for (const auto& source : character_sources) {

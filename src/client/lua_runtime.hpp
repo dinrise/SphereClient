@@ -105,7 +105,6 @@ struct LuaGameWindowConfig {
     float grass_generation_margin = 0.0f;
     float grass_wind_amplitude = 0.0f;
     float grass_wind_speed = 0.0f;
-    std::vector<std::wstring> grass_mode_text;
     std::wstring camera_mode;
     std::wstring sky_texture;
     float sky_radius = 0.0f;

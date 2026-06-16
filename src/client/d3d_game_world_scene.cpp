@@ -42,6 +42,13 @@ constexpr float kPlayerAnimSecondsPerFrame = 0.08f; // matches character-select 
 // toward the face front.
 constexpr float kEyeBelowCrownWorld = 0.16f;  // distance down from the crown
 constexpr float kEyeForwardModel = 0.18f;      // toward the face front (model +z)
+// While moving, the body leans forward and its neck cut would ride into the
+// lens, so (like the original) the model snaps backward along the look axis.
+constexpr float kMoveBodyBackShift = 0.5f;
+// Walk bob: while moving, the eye follows the head-top's vertical motion through
+// the walk/run cycle (as the original's head-attached camera does), giving a
+// small up/down sway. Idle keeps the eye locked. No start/stop offset.
+constexpr float kWalkBobScale = 1.0f;
 
 struct WorldVertex {
     float x;
@@ -606,6 +613,10 @@ struct GameWorldScene::Impl {
     int player_head_bone = -1;
     bool player_eye_valid = false;
     bool player_eye_initialized = false;
+    bool player_walking = false;
+    float player_live_crown_y = 0.0f;   // current frame's head-top world y
+    float player_locked_crown_y = 0.0f; // baseline head-top (stable idle eye)
+    float player_body_shift = 0.0f; // eased backward offset while moving
     float player_eye_local_x = 0.0f;
     float player_eye_local_y = 0.0f;
     float player_eye_local_z = 0.0f;
@@ -732,12 +743,13 @@ struct GameWorldScene::Impl {
             player_vertex_buffer->Unlock();
         }
 
-        // Ride the eye just below the crown of the skinned body. The bone
-        // translations in this rig are not bone world positions, so the body's
-        // own vertical extent is the reliable reference for eye height.
-        // Lock the eye height to the first skinned frame so idle body motion
-        // (breathing) does not bob the camera; movement bob is added separately.
+        // Track the head-top each frame; the eye rides just below it.
+        player_live_crown_y = crown_world_y;
+        // Lock the baseline eye height to the first skinned frame so idle body
+        // motion (breathing) does not bob the camera. The walking up/down bob is
+        // added in update_view_projection from the live head-top deviation.
         if (!player_eye_initialized) {
+            player_locked_crown_y = crown_world_y;
             player_eye_local_x = 0.0f;
             player_eye_local_y = crown_world_y + kEyeBelowCrownWorld;
             player_eye_local_z = kEyeForwardModel;
@@ -827,6 +839,11 @@ struct GameWorldScene::Impl {
             player_anim_time = 0.0f; // restart the cycle when the action changes
         }
         player_anim_time += (std::max)(0.0f, delta_seconds);
+
+        // Snap the body's backward offset on/off with movement (no easing).
+        player_body_shift = moving ? kMoveBodyBackShift : 0.0f;
+        player_walking = moving;
+
         skin_player_frame();
     }
 
@@ -1735,11 +1752,18 @@ struct GameWorldScene::Impl {
         // falling back to a fixed eye height before the model is skinned.
         Vec3 eye{spawn_x, spawn_y - config.camera_eye_height, spawn_z};
         if (player_eye_valid) {
-            const float c = std::cos(spawn_angle);
-            const float s = std::sin(spawn_angle);
+            // Eye offset rotates with the body (camera_yaw), keeping the lens at
+            // the face front regardless of facing.
+            const float c = std::cos(camera_yaw);
+            const float s = std::sin(camera_yaw);
             eye.x = spawn_x + player_eye_local_x * c + player_eye_local_z * s;
             eye.y = spawn_y + player_eye_local_y;
             eye.z = spawn_z - player_eye_local_x * s + player_eye_local_z * c;
+            // While walking, let the eye follow the head-top's vertical motion
+            // through the stride for a small up/down bob (idle stays locked).
+            if (player_walking) {
+                eye.y += (player_live_crown_y - player_locked_crown_y) * kWalkBobScale;
+            }
         }
         const float horizontal_distance = std::cos(camera_pitch) * config.camera_look_distance;
         const Vec3 target{
@@ -1921,10 +1945,14 @@ struct GameWorldScene::Impl {
         if (!player_vertex_buffer || !player_index_buffer || player_batches.empty()) {
             return;
         }
-        auto world = rotation_y_matrix(spawn_angle);
-        world._41 = spawn_x;
+        // The body faces where the camera looks, so in first person it stays
+        // locked below the view as you turn (camera rides inside the head).
+        auto world = rotation_y_matrix(camera_yaw);
+        // Ease the body backward along the look axis while moving so the
+        // forward-leaning torso's neck cut never enters the lens.
+        world._41 = spawn_x - std::sin(camera_yaw) * player_body_shift;
         world._42 = spawn_y;
-        world._43 = spawn_z;
+        world._43 = spawn_z - std::cos(camera_yaw) * player_body_shift;
         device->SetTransform(D3DTS_WORLD, &world);
         device->SetFVF(kWorldVertexFvf);
         device->SetStreamSource(0, player_vertex_buffer, 0, sizeof(WorldVertex));

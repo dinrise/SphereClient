@@ -525,7 +525,6 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "grass_generation_margin", 1.0, 100.0, out.grass_generation_margin, error) &&
         read_game_number_field(state, config_index, "grass_wind_amplitude", 0.0, 0.5, out.grass_wind_amplitude, error) &&
         read_game_number_field(state, config_index, "grass_wind_speed", 0.0, 20.0, out.grass_wind_speed, error) &&
-        read_string_array_field(state, config_index, "grass_mode_text", out.grass_mode_text, error) &&
         read_game_string_field(state, config_index, "sky_texture", out.sky_texture, error) &&
         read_game_number_field(state, config_index, "sky_radius", 10.0, 10000.0, out.sky_radius, error) &&
         read_game_number_field(state, config_index, "sky_height_scale", 0.1, 5.0, out.sky_height_scale, error) &&
@@ -571,10 +570,6 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
     }
     if (out.grass_scale_min > out.grass_scale_max) {
         error = L"lua\\game_window.lua grass_scale_min must not exceed grass_scale_max";
-        return false;
-    }
-    if (out.grass_mode_text.size() != 3) {
-        error = L"lua\\game_window.lua grass_mode_text must contain exactly three labels";
         return false;
     }
     if (out.near_clip >= out.far_clip || out.fog_start >= out.fog_end || out.fog_end > out.far_clip ||

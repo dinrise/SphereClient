@@ -112,7 +112,6 @@ M.grass_flatness_normal_y = 0.75
 M.grass_generation_margin = 16.0
 M.grass_wind_amplitude = 0.018
 M.grass_wind_speed = 1.35
-M.grass_mode_text = {"Выкл", "Вкл", "Аним"}
 M.terrain_microtexture = "landscape/bs_.mtx"
 -- Sky.txt t00, active through the original weather manager.
 M.sky_texture = "landscape/clouds.dds"

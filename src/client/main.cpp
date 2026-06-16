@@ -27,6 +27,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1204,6 +1205,80 @@ void textured_quad_blit(HDC dc, const sphere::client::BitmapImage& image, const 
     DeleteObject(bitmap);
 }
 
+// Blit a texture region modulated by a vertex color (texture * tint / 255),
+// matching the original UI which tints sprites by the control's diffuse color.
+// The source texture is premultiplied, so we scale the premultiplied RGB.
+void blit_tinted(HDC dc, const sphere::client::BitmapImage& image, int dx, int dy, int dw, int dh, int sx, int sy, int sw, int sh, int tint_r, int tint_g, int tint_b, int tint_a) {
+    if (!image.pixels || dw <= 0 || dh <= 0 || sw == 0 || sh == 0) {
+        return;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = dw;
+    info.bmiHeader.biHeight = -dh;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        return;
+    }
+    auto* out = static_cast<std::uint8_t*>(pixels);
+    for (int y = 0; y < dh; ++y) {
+        const int src_y = std::clamp(sy + (sh > 0 ? y * sh / dh : 0), 0, image.height - 1);
+        const auto* src_row = image.pixels + static_cast<std::size_t>(src_y) * image.stride;
+        auto* dst_row = out + static_cast<std::size_t>(y) * dw * 4;
+        for (int xp = 0; xp < dw; ++xp) {
+            const int src_x = std::clamp(sx + (sw > 0 ? xp * sw / dw : 0), 0, image.width - 1);
+            const auto* s = src_row + src_x * 4;
+            dst_row[xp * 4 + 0] = static_cast<std::uint8_t>(s[0] * tint_b / 255 * tint_a / 255);
+            dst_row[xp * 4 + 1] = static_cast<std::uint8_t>(s[1] * tint_g / 255 * tint_a / 255);
+            dst_row[xp * 4 + 2] = static_cast<std::uint8_t>(s[2] * tint_r / 255 * tint_a / 255);
+            dst_row[xp * 4 + 3] = static_cast<std::uint8_t>(s[3] * tint_a / 255);
+        }
+    }
+    HDC mem_dc = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(mem_dc, bitmap);
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    AlphaBlend(dc, dx, dy, dw, dh, mem_dc, 0, 0, dw, dh, blend);
+    SelectObject(mem_dc, old);
+    DeleteDC(mem_dc);
+    DeleteObject(bitmap);
+}
+
+// Draw a window sprite tinted by an (r,g,b) diffuse color (per the original
+// SlotCtrl, which modulates slotborder/slotfull/slotempty by control colors).
+void draw_sprite_from_window_tinted(HDC dc, const sphere::client::UiWindowDef& window, const std::wstring& sprite_name, int x, int y, int tint_r, int tint_g, int tint_b, int tint_a) {
+    const auto it = window.sprites.find(lowercase(sprite_name));
+    if (it == window.sprites.end()) {
+        return;
+    }
+    for (const auto& piece : it->second.pieces) {
+        auto* texture = texture_for(piece.texture_name);
+        if (!texture || !*texture) {
+            continue;
+        }
+        int sx = piece.src_left;
+        int sy = piece.src_top;
+        int sw = piece.src_right - piece.src_left;
+        int sh = piece.src_bottom - piece.src_top;
+        const int dx = x + min(piece.dst_left, piece.dst_right);
+        const int dy = y + min(piece.dst_top, piece.dst_bottom);
+        const int dw = abs(piece.dst_right - piece.dst_left);
+        const int dh = abs(piece.dst_bottom - piece.dst_top);
+        if (piece.dst_right < piece.dst_left) { sx += sw; sw = -sw; }
+        if (piece.dst_bottom < piece.dst_top) { sy += sh; sh = -sh; }
+        if (sw != 0 && sh != 0 && dw > 0 && dh > 0) {
+            blit_tinted(dc, *texture, dx, dy, dw, dh, sx, sy, sw, sh, tint_r, tint_g, tint_b, tint_a);
+        }
+    }
+}
+
 void draw_sprite_from_window(HDC dc, const sphere::client::UiWindowDef& window, const std::wstring& sprite_name, int x, int y) {
     const auto it = window.sprites.find(lowercase(sprite_name));
     if (it == window.sprites.end()) {
@@ -1588,9 +1663,11 @@ std::wstring game_control_text(const sphere::client::UiWindowDef& window, const 
         case 9:
             return quality_text(g_app->settings.shadow_quality, true);
         case 10: {
-            const auto& labels = g_app->lua_boot.game_window.grass_mode_text;
+            // Grass label from the original interface strings (strings.ui),
+            // language-aware: 0=Выкл.(OPT17), 1=Вкл.(OPT16), 2=Аним.(OPT36).
+            const wchar_t* keys[] = {L"UISTR_WT_OPT17", L"UISTR_WT_OPT16", L"UISTR_WT_OPT36"};
             const auto mode = static_cast<std::size_t>(std::clamp(g_app->settings.grass_quality, 0, 2));
-            return mode < labels.size() ? labels[mode] : L"";
+            return ui_string(keys[mode]);
         }
         case 22:
             return quality_text(g_app->settings.reflection_quality, false);
@@ -1680,6 +1757,21 @@ void draw_game_control(HDC dc, const sphere::client::UiWindowDef& window, int wi
         return;
     }
     if (class_is(def, L"Slot")) {
+        // Empty slot rendering matches SphereUI::SlotCtrl::Draw (Ghidra):
+        //   fill = slotfull (or slotempty) modulated by RGB(0x14,0x14,0x14) at
+        //          alpha dc/2  (this+0x1a8 tint, this+0xdc alpha);
+        //   border = slotborder modulated by RGB(0x9e,0x7c,0x6a) at alpha dc.
+        // dc (control alpha) is 0xff for a shown slot. The dark fill tint makes
+        // even the white slot_simple block a subtle recess, and the brown border
+        // blends with the wooden window (it is NOT white).
+        constexpr int kDc = 255;
+        const auto& fill = !def.slot_full_image.empty() ? def.slot_full_image : def.slot_empty_image;
+        if (!fill.empty()) {
+            draw_sprite_from_window_tinted(dc, window, fill, rc.left, rc.top, 0x14, 0x14, 0x14, kDc / 2);
+        }
+        if (!def.slot_border_image.empty()) {
+            draw_sprite_from_window_tinted(dc, window, def.slot_border_image, rc.left, rc.top, 0x9e, 0x7c, 0x6a, kDc);
+        }
         return;
     }
     if (class_is(def, L"CheckBox")) {
@@ -1790,6 +1882,27 @@ void draw_game_control(HDC dc, const sphere::client::UiWindowDef& window, int wi
     }
 }
 
+void log_control_crash(const wchar_t* window_name, int id, const wchar_t* class_id) {
+    static std::set<std::wstring> seen;
+    std::wstring key = std::wstring(window_name) + L"#" + std::to_wstring(id);
+    if (seen.insert(key).second) {
+        append_client_log(std::wstring(L"[control crash] window=") + window_name + L" id=" + std::to_wstring(id) + L" class=" + class_id);
+    }
+}
+
+// Guard a single control's draw with SEH so a faulty control logs itself and is
+// skipped instead of taking down the whole client (used to find/contain crashes
+// while bringing unfinished windows up to the original).
+int draw_game_control_guarded(HDC dc, const sphere::client::UiWindowDef& window, int window_index, RECT window_rect, const sphere::client::UiControlDef& def) {
+    __try {
+        draw_game_control(dc, window, window_index, window_rect, def);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_control_crash(window.name.c_str(), def.id, def.class_id.c_str());
+        return 1;
+    }
+}
+
 void draw_game_window(HDC dc, HWND hwnd, const sphere::client::UiWindowDef& window, int window_index) {
     if (window_index >= 0 && window_index < static_cast<int>(g_app->game_window_visible.size()) &&
         !g_app->game_window_visible[static_cast<std::size_t>(window_index)]) {
@@ -1810,7 +1923,24 @@ void draw_game_window(HDC dc, HWND hwnd, const sphere::client::UiWindowDef& wind
         draw_text_centered(dc, title, title_rc, window.font_index, window.text_color);
     }
     for (const auto& control : window.controls) {
-        draw_game_control(dc, window, window_index, rect, control);
+        draw_game_control_guarded(dc, window, window_index, rect, control);
+    }
+}
+
+void log_window_crash(const wchar_t* window_name, int window_index) {
+    static std::set<int> seen;
+    if (seen.insert(window_index).second) {
+        append_client_log(std::wstring(L"[window crash] window=") + window_name + L" index=" + std::to_wstring(window_index));
+    }
+}
+
+// SEH-guard a whole window's draw so one faulty window logs itself and is
+// skipped instead of crashing the overlay render.
+void draw_game_window_guarded(HDC dc, HWND hwnd, const sphere::client::UiWindowDef& window, int window_index) {
+    __try {
+        draw_game_window(dc, hwnd, window, window_index);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_window_crash(window.name.c_str(), window_index);
     }
 }
 
@@ -2657,7 +2787,7 @@ bool update_game_overlay(HWND hwnd) {
         old_font = SelectObject(dc, g_app->ui_font);
     }
     for (const int index : g_app->game_window_z_order) {
-        draw_game_window(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
+        draw_game_window_guarded(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
     }
     if (old_font) {
         SelectObject(dc, old_font);
@@ -2873,7 +3003,7 @@ void paint_game_scene(HWND hwnd, HDC dc) {
     DeleteObject(black);
 
     for (const int index : g_app->game_window_z_order) {
-        draw_game_window(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
+        draw_game_window_guarded(dc, hwnd, g_app->game_windows[static_cast<std::size_t>(index)], index);
     }
 }
 

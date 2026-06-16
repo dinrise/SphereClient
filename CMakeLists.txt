@@ -114,6 +114,11 @@ add_executable(ui_dump
 )
 target_link_libraries(ui_dump PRIVATE newclient_common user32)
 
+add_executable(sph_decode
+    src/tools/sph_decode.cpp
+)
+target_link_libraries(sph_decode PRIVATE newclient_common)
+
 if(WIN32)
     add_executable(sphere_client WIN32
         src/client/bitmap_font.cpp
