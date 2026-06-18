@@ -53,6 +53,7 @@ public:
         std::wstring& error);
     bool set_overlay_bitmap(int width, int height, std::vector<std::uint8_t> bgra_pixels, std::wstring& error);
     bool set_grass_quality(int quality, std::wstring& error);
+    void set_fog(float start, float end);
     void set_game_time(float day_fraction);
     float current_game_time() const;
     float camera_facing() const;

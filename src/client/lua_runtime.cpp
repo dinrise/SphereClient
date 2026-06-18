@@ -204,23 +204,30 @@ bool read_ui_control_states(
     return true;
 }
 
-bool read_grass_patterns(lua_State* state, int table_index, std::array<std::vector<std::wstring>, 31>& out, std::wstring& error) {
+bool read_grass_patterns(lua_State* state, int table_index, const char* field, bool allow_empty,
+                         std::array<std::vector<std::wstring>, 31>& out, std::wstring& error) {
     table_index = lua_absindex(state, table_index);
-    lua_getfield(state, table_index, "grass_patterns");
+    lua_getfield(state, table_index, field);
     if (!lua_istable(state, -1)) {
         lua_pop(state, 1);
-        error = lua_game_window_field_error("grass_patterns");
+        error = lua_game_window_field_error(field);
         return false;
     }
     for (int type = 1; type < static_cast<int>(out.size()); ++type) {
         lua_rawgeti(state, -1, type);
-        if (!lua_istable(state, -1) || lua_rawlen(state, -1) == 0) {
-            lua_pop(state, 2);
-            error = lua_game_window_field_error("grass_patterns");
-            return false;
-        }
         auto& patterns = out[static_cast<std::size_t>(type)];
         patterns.clear();
+        // Flower slots are optional per pattern (many types have none): a missing
+        // or empty entry is allowed when allow_empty is set.
+        if (lua_isnil(state, -1) && allow_empty) {
+            lua_pop(state, 1);
+            continue;
+        }
+        if (!lua_istable(state, -1) || (lua_rawlen(state, -1) == 0 && !allow_empty)) {
+            lua_pop(state, 2);
+            error = lua_game_window_field_error(field);
+            return false;
+        }
         const auto count = static_cast<int>(lua_rawlen(state, -1));
         patterns.reserve(static_cast<std::size_t>(count));
         for (int index = 1; index <= count; ++index) {
@@ -228,7 +235,7 @@ bool read_grass_patterns(lua_State* state, int table_index, std::array<std::vect
             const char* value = lua_tostring(state, -1);
             if (!value || value[0] == '\0') {
                 lua_pop(state, 3);
-                error = lua_game_window_field_error("grass_patterns");
+                error = lua_game_window_field_error(field);
                 return false;
             }
             patterns.push_back(widen_ascii(value));
@@ -493,7 +500,8 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_string_array_field(state, config_index, "model_dirs", out.model_dirs, error) &&
         read_string_array_field(state, config_index, "static_object_dirs", out.static_object_dirs, error) &&
         read_game_string_field(state, config_index, "grassmap_dir", out.grassmap_dir, error) &&
-        read_grass_patterns(state, config_index, out.grass_patterns, error) &&
+        read_grass_patterns(state, config_index, "grass_patterns", false, out.grass_patterns, error) &&
+        read_grass_patterns(state, config_index, "grass_flower_patterns", true, out.grass_flower_patterns, error) &&
         read_string_array_field(state, config_index, "grass_detail_models", out.grass_detail_models, error) &&
         read_grass_sample_offsets(state, config_index, out.grass_sample_offsets, error) &&
         read_game_string_field(state, config_index, "terrain_microtexture", out.terrain_microtexture, error) &&
@@ -516,6 +524,7 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "grass_radius", 1.0, 500.0, out.grass_radius, error) &&
         read_game_number_field(state, config_index, "grass_spacing", 0.25, 100.0, out.grass_spacing, error) &&
         read_game_integer_field(state, config_index, "grass_detail_count", 1, 64, out.grass_detail_count, error) &&
+        read_game_integer_field(state, config_index, "grass_flower_count_max", 0, 256, out.grass_flower_count_max, error) &&
         read_game_number_field(state, config_index, "grass_jitter_fraction", 0.0, 0.5, out.grass_jitter_fraction, error) &&
         read_game_number_field(state, config_index, "grass_scale_min", 0.01, 10.0, out.grass_scale_min, error) &&
         read_game_number_field(state, config_index, "grass_scale_max", 0.01, 10.0, out.grass_scale_max, error) &&
@@ -548,6 +557,24 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "max_step_height", 0.01, 20.0, out.max_step_height, error) &&
         read_game_number_field(state, config_index, "movement_collision_step", 0.01, 10.0, out.movement_collision_step, error) &&
         read_game_number_field(state, config_index, "collision_floor_normal_threshold", 0.0, 1.0, out.collision_floor_normal_threshold, error) &&
+        read_game_number_field(state, config_index, "slope_slide_normal_y", 0.0, 1.0, out.slope_slide_normal_y, error) &&
+        read_game_number_field(state, config_index, "slope_slide_factor", 0.0, 10.0, out.slope_slide_factor, error) &&
+        read_game_number_field(state, config_index, "jump_impulse", -100.0, 0.0, out.jump_impulse, error) &&
+        read_game_number_field(state, config_index, "jump_gravity", 0.1, 100.0, out.jump_gravity, error) &&
+        read_game_number_field(state, config_index, "water_day_start", 0.0, 1.0, out.water_day_start, error) &&
+        read_game_number_field(state, config_index, "water_day_end", 0.0, 1.0, out.water_day_end, error) &&
+        read_game_number_field(state, config_index, "water_night_before", 0.0, 1.0, out.water_night_before, error) &&
+        read_game_number_field(state, config_index, "water_night_after", 0.0, 1.0, out.water_night_after, error) &&
+        read_game_number_field(state, config_index, "water_transition_width", 0.001, 1.0, out.water_transition_width, error) &&
+        read_game_number_field(state, config_index, "water_reflect_night", 0.0, 1.0, out.water_reflect_night, error) &&
+        read_game_number_field(state, config_index, "water_reflect_transition", 0.0, 1.0, out.water_reflect_transition, error) &&
+        read_game_number_field(state, config_index, "wave_amp", 0.0, 10.0, out.wave_amp, error) &&
+        read_game_number_field(state, config_index, "wave_scale", 0.0, 50.0, out.wave_scale, error) &&
+        read_game_number_field(state, config_index, "wave_freq_x", 0.0, 100.0, out.wave_freq_x, error) &&
+        read_game_number_field(state, config_index, "wave_freq_z", 0.0, 100.0, out.wave_freq_z, error) &&
+        read_game_number_field(state, config_index, "wave_cell_step", 0.1, 1000.0, out.wave_cell_step, error) &&
+        read_game_number_field(state, config_index, "wave_speed", 0.0, 100.0, out.wave_speed, error) &&
+        read_game_integer_field(state, config_index, "water_reflection_enabled", 0, 1, out.water_reflection_enabled, error) &&
         read_game_integer_field(state, config_index, "position_send_interval_ms", 10, 10000, out.position_send_interval_ms, error) &&
         read_game_number_field(state, config_index, "near_clip", 0.001, 100.0, out.near_clip, error) &&
         read_game_number_field(state, config_index, "far_clip", 10.0, 10000.0, out.far_clip, error) &&

@@ -73,6 +73,7 @@ struct LuaGameWindowConfig {
     std::vector<std::wstring> static_object_dirs;
     std::wstring grassmap_dir;
     std::array<std::vector<std::wstring>, 31> grass_patterns{};
+    std::array<std::vector<std::wstring>, 31> grass_flower_patterns{};  // slots 5-9 per pattern (FUN_00460570), "flower"+suffix
     std::vector<std::wstring> grass_detail_models;
     std::vector<LuaGrassSampleOffset> grass_sample_offsets;
     std::wstring terrain_microtexture;
@@ -96,6 +97,7 @@ struct LuaGameWindowConfig {
     float grass_radius = 0.0f;
     float grass_spacing = 0.0f;
     int grass_detail_count = 0;
+    int grass_flower_count_max = 0;  // max flowers per all-flat cell (FUN_0047a150: (rand*0x14)>>15)
     float grass_jitter_fraction = 0.0f;
     float grass_scale_min = 0.0f;
     float grass_scale_max = 0.0f;
@@ -128,6 +130,29 @@ struct LuaGameWindowConfig {
     float max_step_height = 0.0f;
     float movement_collision_step = 0.0f;
     float collision_floor_normal_threshold = 0.0f;
+    float slope_slide_normal_y = 0.0f;  // floors below this |normal.y| slide downhill under gravity
+    float slope_slide_factor = 0.0f;
+    float jump_impulse = 0.0f;   // vertical velocity on jump (ControlMove 0x28C = -5; +y is down)
+    float jump_gravity = 0.0f;   // native physics gravity (FUN_004755e0 double @0x504248 = 9.8)
+    // Water reflection strength vs time-of-day (decoded from FUN_004db5e0): reflect
+    // amount = gradientCoeff * (night/transition multiplier). Day = 0 (pure colour),
+    // peaks in dawn/dusk, moderate at deep night.
+    float water_day_start = 0.34f;          // _DAT_0050a70c
+    float water_day_end = 0.66f;            // _DAT_0050a708
+    float water_night_before = 0.19f;       // _DAT_004ff5a0
+    float water_night_after = 0.81f;        // (float)_DAT_0050a700
+    float water_transition_width = 0.15f;   // _DAT_004fef38
+    float water_reflect_night = 0.3f;       // _DAT_004fe9a0
+    float water_reflect_transition = 0.5f;  // _DAT_004fe7f8
+    // Wave animation (FUN_0046a070): vertexY = (sin(phase)+amp)*scale + baseY,
+    // phase = worldX*(freq_x/cell_step) + worldZ*(freq_z/cell_step) + time*speed.
+    float wave_amp = 1.0f;        // _DAT_004fe850
+    float wave_scale = 0.12f;     // _DAT_00502910 (per-type wave height; type-1 value)
+    float wave_freq_x = 3.93f;    // _DAT_00504040
+    float wave_freq_z = 2.02f;    // _DAT_00504048
+    float wave_cell_step = 8.33f; // _DAT_00504038 (= tile_size/12)
+    float wave_speed = 1.5f;      // time→phase rad/s (orig = DAT_04eb9cd0*pi/16; counter rate not extracted → tunable)
+    int water_reflection_enabled = 1;  // 0 = flat time-coloured water only (no planar reflection)
     int position_send_interval_ms = 0;
     float near_clip = 0.0f;
     float far_clip = 0.0f;

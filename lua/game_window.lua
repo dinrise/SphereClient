@@ -168,6 +168,22 @@ M.grass_patterns = {
     [29] = {"grass101", "grass101", "grass101", "grass102", "grass102"},
     [30] = {"grass100", "grass100", "grass100", "grass102", "grass102"},
 }
+-- Flower slots 5-9 of each pattern (FUN_00460570), prefixed "flower". Placed by
+-- dyn_grass_loop only when all 4 cell samples are flat grass (no detail). Empty
+-- = no flowers for that type. The placement picks a random slot 0-4 and skips it
+-- if it is past this list (matches the native contiguous-from-slot-5 layout).
+M.grass_flower_patterns = {
+    [1]  = {"flower1_21", "flower1_41"},
+    [2]  = {"flower1_11", "flower1_31"},
+    [3]  = {"flower1_21", "flower1_61"},
+    [5]  = {"flower1_21", "flower1_41", "flower1_41"},
+    [6]  = {"flower1_11", "flower1_21", "flower1_31"},
+    [7]  = {"flower1_41", "flower1_51"},
+    [10] = {"flower1_11", "flower1_31"},
+    [12] = {"flower1_61"},
+    [13] = {"flower1_11", "flower1_21", "flower1_51"},
+}
+M.grass_flower_count_max = 20      -- (rand*0x14)>>15 → 0..19 flowers per flat cell
 M.grid_width = 80
 M.origin_row = 40
 M.origin_column = 39
@@ -191,13 +207,53 @@ M.player_collision_radius = 0.32
 M.player_collision_height = 1.8
 M.max_step_height = 0.6
 M.movement_collision_step = 0.2
-M.collision_floor_normal_threshold = 0.7
+-- Walkable-floor cutoff: a triangle counts as floor (you can stand/step on it,
+-- and it is not a collision wall) when |normal.y| >= this. 0.4 ≈ up to ~66deg
+-- slopes (pyramid/hill ramps are climbable); steeper faces stay walls. Slopes
+-- below grass_flatness_normal_y slide you down (see slope-slide in update).
+-- Wall cutoff: faces with |normal.y| below this are walls (block movement);
+-- at/above it they are walkable (you walk/slide on them). 0.2 (~up to 78deg)
+-- so ramp models (mpyramid/hill have walkable sub-faces down to ~0.2) can be
+-- climbed without invisible walls; near-vertical faces still block.
+M.collision_floor_normal_threshold = 0.2
+-- Auto-slide: on a floor whose |normal.y| is below this, gravity drags the body
+-- downslope (you slide down a steep ramp when you stop). slope_slide_factor
+-- scales the gravity-along-slope speed.
+M.slope_slide_normal_y = 0.72
+M.slope_slide_factor = 0.6
+-- Jump physics, original values verified in Ghidra: ControlMove sets the player's
+-- vertical-velocity field 0x28C = -5 on jump (+y is down, so negative = up);
+-- native physics FUN_004755e0 integrates vy += g*dt with g = the double constant
+-- at 0x00504248 = 9.8.
+M.jump_impulse = -5.0
+M.jump_gravity = 9.8
+-- Water reflection strength vs time-of-day, decoded from FUN_004db5e0 (day boundaries
+-- match Sky.txt day state). reflect = gradientCoeff(time) * multiplier: 0 in full day
+-- (water shows its own colour), peaks in dawn/dusk, moderate at deep night.
+M.water_day_start = 0.34          -- _DAT_0050a70c
+M.water_day_end = 0.66            -- _DAT_0050a708
+M.water_night_before = 0.19       -- _DAT_004ff5a0
+M.water_night_after = 0.81        -- (float)_DAT_0050a700
+M.water_transition_width = 0.15   -- _DAT_004fef38
+M.water_reflect_night = 0.3       -- _DAT_004fe9a0
+M.water_reflect_transition = 0.5  -- _DAT_004fe7f8
+-- Wave animation, decoded from FUN_0046a070: vertexY = (sin(phase)+amp)*scale + baseY,
+-- phase = worldX*(freq_x/cell_step) + worldZ*(freq_z/cell_step) + time*speed.
+M.wave_amp = 1.0          -- _DAT_004fe850
+M.wave_scale = 0.12       -- _DAT_00502910 (per-type wave height)
+M.wave_freq_x = 3.93      -- _DAT_00504040
+M.wave_freq_z = 2.02      -- _DAT_00504048
+M.wave_cell_step = 8.33   -- _DAT_00504038 (tile_size/12)
+M.wave_speed = 1.5        -- orig DAT_04eb9cd0*pi/16; counter rate not extracted → tunable
+M.water_reflection_enabled = 1  -- set 0 to disable planar reflection (flat time-coloured water only)
 M.position_send_interval_ms = 100
 -- ControlMove explicitly calls view_set_z(1, 0.2).
 M.near_clip = 0.2
 M.far_clip = 260.0
-M.fog_start = 120.0
-M.fog_end = 200.0
+-- Defaults; overridden at runtime from the "Туман"/FOGDIST graphics setting
+-- (see fog_range_for_distance / apply_fog_distance).
+M.fog_start = 70.0
+M.fog_end = 170.0
 M.clear_red = 105
 M.clear_green = 157
 M.clear_blue = 205

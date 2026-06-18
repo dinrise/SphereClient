@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -49,12 +50,11 @@ constexpr float kMoveBodyBackShift = 0.5f;
 // the walk/run cycle (as the original's head-attached camera does), giving a
 // small up/down sway. Idle keeps the eye locked. No start/stop offset.
 constexpr float kWalkBobScale = 1.0f;
-// Jump: ControlMove sets the player's vertical velocity field (0x28C) to -5
-// (up; world +y is down) when the jump key is pressed on the ground. Gravity is
-// applied engine-side; its exact constant is not in the scripts, so this value
-// is tuned to a natural hop and may be refined against Ghidra.
-constexpr float kJumpImpulse = -5.0f;
-constexpr float kJumpGravity = 20.0f;
+// Jump impulse and gravity are data-driven (config.jump_impulse / jump_gravity,
+// from game_window.lua). Original values, verified in Ghidra: ControlMove sets
+// the vertical-velocity field 0x28C to -5 on jump (potions scale it ×2/×4 via the
+// i4/i5 effect flags); the native physics FUN_004755e0 integrates vy += g*dt with
+// g = the double at 0x00504248 = 9.8.
 
 struct WorldVertex {
     float x;
@@ -95,6 +95,15 @@ struct TerrainResource {
     UINT index_count = 0;
     std::vector<Vec3> positions;
     std::vector<std::uint16_t> indices;
+    // Water surface for this patch (from the matching .wtr; 12x12 height grid,
+    // value >=900 = no water). Empty when the patch has no water.
+    IDirect3DVertexBuffer9* water_vertex_buffer = nullptr;
+    IDirect3DIndexBuffer9* water_index_buffer = nullptr;
+    UINT water_vertex_count = 0;
+    UINT water_index_count = 0;
+    float water_height = 0.0f;   // representative water-surface Y for this patch (planar-reflection plane)
+    bool has_water = false;
+    std::vector<WorldVertex> water_cpu_verts;  // base water verts (for per-frame wave Y displacement)
 };
 
 struct TerrainInstance {
@@ -286,6 +295,85 @@ D3DMATRIX multiply_matrix(const D3DMATRIX& left, const D3DMATRIX& right) {
         }
     }
     return out;
+}
+
+D3DMATRIX transpose_matrix(const D3DMATRIX& m) {
+    D3DMATRIX out{};
+    const auto* a = reinterpret_cast<const float*>(&m);
+    auto* r = reinterpret_cast<float*>(&out);
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            r[row * 4 + col] = a[col * 4 + row];
+        }
+    }
+    return out;
+}
+
+// Parse the CTAB (constant table) embedded in a compiled D3D9 shader's comment
+// stream, returning a name -> float-constant-register map. Register assignment
+// differs per shader permutation, so constants must be looked up by name.
+std::unordered_map<std::string, int> parse_shader_constants(const std::vector<std::uint8_t>& code) {
+    std::unordered_map<std::string, int> out;
+    if (code.size() < 8) {
+        return out;
+    }
+    auto rd = [&](std::size_t o) -> std::uint32_t {
+        return static_cast<std::uint32_t>(code[o]) | (static_cast<std::uint32_t>(code[o + 1]) << 8) |
+               (static_cast<std::uint32_t>(code[o + 2]) << 16) | (static_cast<std::uint32_t>(code[o + 3]) << 24);
+    };
+    std::size_t off = 4;  // skip version token
+    while (off + 4 <= code.size()) {
+        const std::uint32_t tok = rd(off);
+        if (tok == 0x0000FFFF) {
+            break;  // END
+        }
+        if ((tok & 0xFFFF) == 0xFFFE) {  // comment token
+            const std::uint32_t clen = (tok >> 16) & 0x7FFF;
+            const std::size_t cdata = off + 4;
+            if (cdata + 4 <= code.size() && rd(cdata) == 0x42415443) {  // 'CTAB'
+                const std::size_t ct = cdata + 4;  // CTAB blob base (offsets are relative to here)
+                const std::uint32_t nconst = rd(ct + 12);
+                const std::uint32_t cinfo = rd(ct + 16);
+                for (std::uint32_t i = 0; i < nconst; ++i) {
+                    const std::size_t e = ct + cinfo + i * 20;
+                    if (e + 20 > code.size()) {
+                        break;
+                    }
+                    const std::uint32_t name_off = rd(e);
+                    const std::uint16_t reg_set = static_cast<std::uint16_t>(code[e + 4] | (code[e + 5] << 8));
+                    const std::uint16_t reg_idx = static_cast<std::uint16_t>(code[e + 6] | (code[e + 7] << 8));
+                    if (reg_set != 2) {  // only float (c#) registers
+                        continue;
+                    }
+                    std::string name;
+                    for (std::size_t p = ct + name_off; p < code.size() && code[p]; ++p) {
+                        name.push_back(static_cast<char>(code[p]));
+                    }
+                    out[name] = reg_idx;
+                }
+            }
+            off += 1 + clen;
+            continue;
+        }
+        off += 1 + ((tok >> 24) & 0x0F);  // normal instruction length
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path) {
+    std::vector<std::uint8_t> data;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return data;
+    }
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size > 0) {
+        data.resize(static_cast<std::size_t>(size));
+        file.read(reinterpret_cast<char*>(data.data()), size);
+    }
+    return data;
 }
 
 D3DMATRIX rotation_x_matrix(float radians) {
@@ -595,8 +683,27 @@ struct GameWorldScene::Impl {
     IDirect3DTexture9* overlay_texture = nullptr;
     IDirect3DTexture9* terrain_microtexture = nullptr;
     IDirect3DTexture9* sky_texture = nullptr;
+    IDirect3DTexture9* water_texture = nullptr;
+    // Planar-reflection render target (the original's 256x256 reflection texture
+    // DAT_04e78d94): the scene is re-rendered mirrored about the water plane into
+    // this RT, then projected onto the water surface.
+    static constexpr UINT kReflectionSize = 256;
+    IDirect3DTexture9* reflection_texture = nullptr;
+    IDirect3DSurface9* reflection_surface = nullptr;
+    IDirect3DSurface9* reflection_depth = nullptr;
+    bool rendering_reflection = false;  // true while drawing into the reflection RT
     IDirect3DVertexBuffer9* player_vertex_buffer = nullptr;
     IDirect3DIndexBuffer9* player_index_buffer = nullptr;
+    // Programmable-shader path (ported from the original Shaders\Vertex|Pixel\*.vsc/.psc).
+    IDirect3DVertexDeclaration9* world_decl = nullptr;
+    IDirect3DVertexShader9* base_vs = nullptr;
+    IDirect3DPixelShader9* base_ps = nullptr;
+    IDirect3DPixelShader9* debug_ps = nullptr;  // visualises texcoord (debug_tc.psc)
+    std::unordered_map<std::string, int> base_vs_consts;
+    bool world_shaders_ready = false;
+    D3DMATRIX view_matrix{};
+    D3DMATRIX projection_matrix{};
+    D3DMATRIX view_projection_matrix{};
     D3DPRESENT_PARAMETERS present{};
     std::filesystem::path root_path;
     LuaGameWindowConfig config;
@@ -629,11 +736,15 @@ struct GameWorldScene::Impl {
     float spawn_x = 0.0f;
     float spawn_y = 0.0f;
     float velocity_y = 0.0f; // vertical velocity for jump/gravity (world +y down)
+    float velocity_x = 0.0f; // horizontal velocity (world space) — kept airborne so a jump carries momentum
+    float velocity_z = 0.0f;
     bool grounded = true;
     float spawn_z = 0.0f;
     float spawn_angle = 0.0f;
     float camera_yaw = 0.0f;
     float camera_pitch = 0.0f;
+    Vec3 camera_eye{};     // last frame's eye/target (for mirroring in the reflection pass)
+    Vec3 camera_target{};
     int terrain_center_row = -1;
     int terrain_center_column = -1;
     int grass_center_x = (std::numeric_limits<int>::min)();
@@ -667,6 +778,15 @@ struct GameWorldScene::Impl {
         release_com(overlay_texture);
         release_com(terrain_microtexture);
         release_com(sky_texture);
+        release_com(water_texture);
+        release_com(reflection_depth);
+        release_com(reflection_surface);
+        release_com(reflection_texture);
+        release_com(base_vs);
+        release_com(base_ps);
+        release_com(debug_ps);
+        release_com(world_decl);
+        world_shaders_ready = false;
         for (auto& batch : player_batches) {
             release_com(batch.texture);
         }
@@ -677,6 +797,8 @@ struct GameWorldScene::Impl {
             release_com(resource->texture);
             release_com(resource->index_buffer);
             release_com(resource->vertex_buffer);
+            release_com(resource->water_index_buffer);
+            release_com(resource->water_vertex_buffer);
         }
         for (auto& [_, resource] : static_resources) {
             for (auto& batch : resource->batches) {
@@ -902,6 +1024,29 @@ struct GameWorldScene::Impl {
         return false;
     }
 
+    // (Re)create the planar-reflection render target + its depth buffer. Both are
+    // D3DPOOL_DEFAULT, so they must be released before a device Reset and remade
+    // after. Failure leaves reflection_texture null → water falls back to flat.
+    void create_reflection_target() {
+        release_com(reflection_depth);
+        release_com(reflection_surface);
+        release_com(reflection_texture);
+        if (!device) {
+            return;
+        }
+        if (FAILED(device->CreateTexture(kReflectionSize, kReflectionSize, 1, D3DUSAGE_RENDERTARGET,
+                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &reflection_texture, nullptr))) {
+            reflection_texture = nullptr;
+            return;
+        }
+        reflection_texture->GetSurfaceLevel(0, &reflection_surface);
+        if (FAILED(device->CreateDepthStencilSurface(kReflectionSize, kReflectionSize,
+                                                     present.AutoDepthStencilFormat, D3DMULTISAMPLE_NONE,
+                                                     0, TRUE, &reflection_depth, nullptr))) {
+            reflection_depth = nullptr;
+        }
+    }
+
     std::filesystem::path resolve_tile_path(const std::string& stem) const {
         for (const auto& dir : config.landscape_dirs) {
             const auto path = root_path / dir / (stem + ".lnd");
@@ -1020,6 +1165,11 @@ struct GameWorldScene::Impl {
         }
 
         std::vector<std::vector<std::uint16_t>> indices_by_material(mesh.info.materials.size());
+        // Collision uses only solid triangles: the MDL triangle flag 0x100 marks
+        // pass-through geometry (foliage/canopy — whole bushes are 0x100, tree
+        // leaves are 0x100 while trunks are 0, solid props like stone/castle are
+        // all 0). Colliding against every triangle put invisible walls in leaves.
+        std::vector<std::uint16_t> collision_idx;
         for (const auto& surface : mesh.surfaces) {
             if (surface.first_triangle_index < 0 || surface.triangle_count < 0 ||
                 surface.first_vertex_index < 0 || surface.vertex_count < 0) {
@@ -1041,9 +1191,17 @@ struct GameWorldScene::Impl {
                 if (triangle.a >= vertex_count || triangle.b >= vertex_count || triangle.c >= vertex_count) {
                     throw std::runtime_error("static model triangle range is invalid: " + model_path.string());
                 }
-                indices.push_back(static_cast<std::uint16_t>(first_vertex + triangle.a));
-                indices.push_back(static_cast<std::uint16_t>(first_vertex + triangle.b));
-                indices.push_back(static_cast<std::uint16_t>(first_vertex + triangle.c));
+                const auto ia = static_cast<std::uint16_t>(first_vertex + triangle.a);
+                const auto ib = static_cast<std::uint16_t>(first_vertex + triangle.b);
+                const auto ic = static_cast<std::uint16_t>(first_vertex + triangle.c);
+                indices.push_back(ia);
+                indices.push_back(ib);
+                indices.push_back(ic);
+                if ((triangle.flags & 0x100) == 0) {  // solid (collidable) triangle
+                    collision_idx.push_back(ia);
+                    collision_idx.push_back(ib);
+                    collision_idx.push_back(ic);
+                }
             }
         }
 
@@ -1068,12 +1226,10 @@ struct GameWorldScene::Impl {
                 device,
                 resolve_model_texture_path(model_path, mesh.info.materials[material]));
             indices.insert(indices.end(), material_indices.begin(), material_indices.end());
-            resource->collision_indices.insert(
-                resource->collision_indices.end(),
-                material_indices.begin(),
-                material_indices.end());
             resource->batches.push_back(batch);
         }
+        // Collision excludes pass-through (flag 0x100) triangles — see above.
+        resource->collision_indices = std::move(collision_idx);
         if (indices.empty() || resource->batches.empty()) {
             throw std::runtime_error("static model has no material batches: " + model_name);
         }
@@ -1264,6 +1420,12 @@ struct GameWorldScene::Impl {
                 grass_cells.insert(key);
                 const float x = static_cast<float>(cell_x) * spacing;
                 const float z = static_cast<float>(cell_z) * spacing;
+                // Track the cell outcome so flowers can be scattered only when all
+                // samples were flat grass and none produced detail (FUN_0047a150:
+                // local_a8 == sample_count && local_9d == 0).
+                int flat_sample_count = 0;
+                bool any_detail = false;
+                int flower_type = 0;
                 for (std::size_t sample_index = 0; sample_index < config.grass_sample_offsets.size(); ++sample_index) {
                     const auto& sample_offset = config.grass_sample_offsets[sample_index];
                     const float sample_x = x + sample_offset.x;
@@ -1304,9 +1466,10 @@ struct GameWorldScene::Impl {
                                 key,
                                 load_static_model_resource(model_name, resolve_model_path(model_name))).first;
                         }
-                        auto world = multiply_matrix(
-                            rotation_y_matrix(unit_random() * 2.0f * kPi),
-                            align_up_matrix(flat_normal));
+                        // Original FUN_0047a150 (flat branch) stores position +
+                        // terrain normal + scale 1.0 with NO random yaw — the blade
+                        // tuft is only aligned to the ground, not spun.
+                        auto world = align_up_matrix(flat_normal);
                         world._41 = sample_x;
                         world._42 = flat_height - resource->second->bounds_max.y;
                         world._43 = sample_z;
@@ -1318,6 +1481,8 @@ struct GameWorldScene::Impl {
                             cell_x,
                             cell_z,
                         });
+                        ++flat_sample_count;
+                        flower_type = static_cast<int>(type);
                         continue;
                     }
 
@@ -1342,10 +1507,11 @@ struct GameWorldScene::Impl {
                                 key,
                                 load_static_model_resource(model_name, model_path)).first;
                         }
-                        const float yaw = unit_random() * 2.0f * kPi;
+                        // Original detail branch (FUN_0047a150): random jitter +
+                        // random scale, but NO random yaw rotation.
                         const float scale =
                             config.grass_scale_min + unit_random() * (config.grass_scale_max - config.grass_scale_min);
-                        auto world = multiply_matrix(scale_matrix(scale), rotation_y_matrix(yaw));
+                        auto world = scale_matrix(scale);
                         world._41 = detail_x;
                         world._42 = height - resource->second->bounds_max.y * scale;
                         world._43 = detail_z;
@@ -1354,6 +1520,65 @@ struct GameWorldScene::Impl {
                             world,
                             unit_random() * 2.0f * kPi,
                             0.65f + unit_random() * 0.35f,
+                            cell_x,
+                            cell_z,
+                        });
+                        any_detail = true;
+                    }
+                }
+
+                // FLOWERS (FUN_0047a150 tail): only when every sample produced flat
+                // grass and none produced detail. Scatter a random count (0..max-1)
+                // of "flower"+suffix models over the cell, each picking a random
+                // flower slot 0-4 and skipping it if the pattern has none there.
+                const int sample_total = static_cast<int>(config.grass_sample_offsets.size());
+                if (flat_sample_count == sample_total && !any_detail && flower_type > 0 &&
+                    flower_type < static_cast<int>(config.grass_flower_patterns.size()) &&
+                    !config.grass_flower_patterns[static_cast<std::size_t>(flower_type)].empty()) {
+                    const auto& flowers = config.grass_flower_patterns[static_cast<std::size_t>(flower_type)];
+                    std::uint32_t flower_state =
+                        (static_cast<std::uint32_t>(cell_x) * 0x27d4eb2dU) ^
+                        (static_cast<std::uint32_t>(cell_z) * 0x165667b1U) ^ 0x9e3779b9U;
+                    auto flower_next = [&flower_state]() {
+                        flower_state ^= flower_state << 13;
+                        flower_state ^= flower_state >> 17;
+                        flower_state ^= flower_state << 5;
+                        return flower_state;
+                    };
+                    auto flower_unit = [&flower_next]() {
+                        return static_cast<float>(flower_next() & 0xffffU) / 65535.0f;
+                    };
+                    const int flower_count =
+                        static_cast<int>(flower_unit() * static_cast<float>(config.grass_flower_count_max));
+                    for (int f = 0; f < flower_count; ++f) {
+                        const float flower_x = x + flower_unit() * spacing;
+                        const float flower_z = z + flower_unit() * spacing;
+                        float flower_h = 0.0f;
+                        Vec3 flower_normal{};
+                        if (!terrain_surface_at(flower_x, flower_z, flower_h, flower_normal)) {
+                            continue;
+                        }
+                        const int slot = static_cast<int>(flower_unit() * 5.0f);  // native (rand*5)>>15
+                        if (slot < 0 || slot >= static_cast<int>(flowers.size())) {
+                            continue;  // empty flower slot → no flower this iteration
+                        }
+                        const auto model_name = narrow_ascii(flowers[static_cast<std::size_t>(slot)]);
+                        const auto key2 = lowercase_ascii(model_name);
+                        auto resource = static_resources.find(key2);
+                        if (resource == static_resources.end()) {
+                            resource = static_resources.emplace(
+                                key2,
+                                load_static_model_resource(model_name, resolve_model_path(model_name))).first;
+                        }
+                        auto world = align_up_matrix(flower_normal);
+                        world._41 = flower_x;
+                        world._42 = flower_h - resource->second->bounds_max.y;
+                        world._43 = flower_z;
+                        grass_instances.push_back(GrassInstance{
+                            resource->second.get(),
+                            world,
+                            flower_unit() * 2.0f * kPi,
+                            0.65f + flower_unit() * 0.35f,
                             cell_x,
                             cell_z,
                         });
@@ -1458,7 +1683,92 @@ struct GameWorldScene::Impl {
         }
         std::memcpy(index_data, indices.data(), index_bytes);
         resource->index_buffer->Unlock();
+        build_water_mesh(*resource, lnd_path);
         return resource;
+    }
+
+    // Build the patch water surface from the matching .wtr (12x12 grid, 2 floats
+    // per cell: [0]=water-surface height in patch-local space (>=900 = no water),
+    // [1]=0). Emits a quad per cell where all four corners are water. Patch-local
+    // X/Z span [0,100] (tile_size); the 12 samples map to that range.
+    void build_water_mesh(TerrainResource& resource, const std::filesystem::path& lnd_path) {
+        auto wtr_path = lnd_path;
+        wtr_path.replace_extension(".wtr");
+        if (!std::filesystem::exists(wtr_path)) {
+            return;
+        }
+        const auto data = bin::read_file(wtr_path);
+        constexpr int kGrid = 12;
+        if (data.size() < static_cast<std::size_t>(kGrid) * kGrid * 2 * 4) {
+            return;
+        }
+        auto height = [&](int r, int c) {
+            return bin::f32le(data, (static_cast<std::size_t>(r) * kGrid + c) * 2 * 4);
+        };
+        // Each cell is [0]=water-surface height, [1]=water mask (int 1 = water,
+        // 0 = no water). The mask — NOT a height threshold — decides where water
+        // exists: dry cells store height 0.0 OR >=900, and 0.0 would otherwise be
+        // read as a surface at world Y 0, spiking the quad ~167 units into the sky.
+        auto is_water = [&](int r, int c) {
+            return bin::i32le(data, (static_cast<std::size_t>(r) * kGrid + c) * 2 * 4 + 4) != 0;
+        };
+        const float step = config.tile_size / static_cast<float>(kGrid - 1);  // 12 samples over [0,100]
+        std::vector<WorldVertex> verts;
+        std::vector<std::uint16_t> idx;
+        for (int r = 0; r < kGrid - 1; ++r) {
+            for (int c = 0; c < kGrid - 1; ++c) {
+                if (!is_water(r, c) || !is_water(r, c + 1) ||
+                    !is_water(r + 1, c) || !is_water(r + 1, c + 1)) {
+                    continue;  // quad not fully submerged (mask must be set on all 4 corners)
+                }
+                const float h00 = height(r, c), h01 = height(r, c + 1);
+                const float h10 = height(r + 1, c), h11 = height(r + 1, c + 1);
+                const auto base = static_cast<std::uint16_t>(verts.size());
+                auto push = [&](int rr, int cc, float h) {
+                    const float x = cc * step;
+                    const float z = rr * step;
+                    verts.push_back(WorldVertex{
+                        x, h, z,
+                        0.0f, -1.0f, 0.0f,  // up (world +Y is down)
+                        0xffffffff,
+                        x / 12.5f, z / 12.5f, 0.0f, 0.0f});
+                };
+                push(r, c, h00);
+                push(r, c + 1, h01);
+                push(r + 1, c, h10);
+                push(r + 1, c + 1, h11);
+                idx.push_back(base);
+                idx.push_back(static_cast<std::uint16_t>(base + 1));
+                idx.push_back(static_cast<std::uint16_t>(base + 2));
+                idx.push_back(static_cast<std::uint16_t>(base + 2));
+                idx.push_back(static_cast<std::uint16_t>(base + 1));
+                idx.push_back(static_cast<std::uint16_t>(base + 3));
+            }
+        }
+        if (verts.empty()) {
+            return;
+        }
+        resource.water_vertex_count = static_cast<UINT>(verts.size());
+        resource.water_index_count = static_cast<UINT>(idx.size());
+        resource.water_height = verts.front().y;  // planar-reflection plane for this patch
+        resource.has_water = true;
+        resource.water_cpu_verts = verts;  // base verts for per-frame wave displacement
+        const UINT vbytes = static_cast<UINT>(verts.size() * sizeof(WorldVertex));
+        if (SUCCEEDED(device->CreateVertexBuffer(vbytes, 0, kWorldVertexFvf, D3DPOOL_MANAGED, &resource.water_vertex_buffer, nullptr))) {
+            void* p = nullptr;
+            if (SUCCEEDED(resource.water_vertex_buffer->Lock(0, vbytes, &p, 0))) {
+                std::memcpy(p, verts.data(), vbytes);
+                resource.water_vertex_buffer->Unlock();
+            }
+        }
+        const UINT ibytes = static_cast<UINT>(idx.size() * sizeof(std::uint16_t));
+        if (SUCCEEDED(device->CreateIndexBuffer(ibytes, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &resource.water_index_buffer, nullptr))) {
+            void* p = nullptr;
+            if (SUCCEEDED(resource.water_index_buffer->Lock(0, ibytes, &p, 0))) {
+                std::memcpy(p, idx.data(), ibytes);
+                resource.water_index_buffer->Unlock();
+            }
+        }
     }
 
     void load_visible_terrain() {
@@ -1502,6 +1812,103 @@ struct GameWorldScene::Impl {
         terrain_center_column = center_column;
     }
 
+    // Load the base lit+textured shader pair (Shaders\Vertex\00_00_00_00.vsc =
+    // transform + 2 directional lights + ambient with 1.3x overbright;
+    // Shaders\Pixel\00_00_00_00_00.psc = texture * saturate(lighting)) and a
+    // vertex declaration matching WorldVertex. Falls back to fixed-function if
+    // anything fails (world_shaders_ready stays false).
+    void load_world_shaders() {
+        const auto vs_code = read_binary_file(root_path / "shaders" / "vertex" / "00_00_00_00.vsc");
+        const auto ps_code = read_binary_file(root_path / "shaders" / "pixel" / "00_00_00_00_00.psc");
+        if (vs_code.empty() || ps_code.empty()) {
+            return;
+        }
+        if (FAILED(device->CreateVertexShader(reinterpret_cast<const DWORD*>(vs_code.data()), &base_vs)) ||
+            FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(ps_code.data()), &base_ps))) {
+            release_com(base_vs);
+            release_com(base_ps);
+            return;
+        }
+        base_vs_consts = parse_shader_constants(vs_code);
+
+        static const D3DVERTEXELEMENT9 elements[] = {
+            {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+            {0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0},
+            {0, 24, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
+            {0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+            {0, 36, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 1},
+            D3DDECL_END()};
+        if (FAILED(device->CreateVertexDeclaration(elements, &world_decl))) {
+            release_com(base_vs);
+            release_com(base_ps);
+            release_com(world_decl);
+            return;
+        }
+        world_shaders_ready = true;
+
+        const auto dbg = read_binary_file(root_path / "shaders" / "pixel" / "debug_tc.psc");
+        if (!dbg.empty()) {
+            device->CreatePixelShader(reinterpret_cast<const DWORD*>(dbg.data()), &debug_ps);
+        }
+    }
+
+    void set_vs_const(const char* name, const float* data, int vec4_count) {
+        const auto it = base_vs_consts.find(name);
+        if (it != base_vs_consts.end()) {
+            device->SetVertexShaderConstantF(static_cast<UINT>(it->second), data, static_cast<UINT>(vec4_count));
+        }
+    }
+
+    // Set the per-frame lighting COLOURS (world-independent): directional sun
+    // colour + ambient. Light 1 is left dark (single sun). The light DIRECTION
+    // is per-object (local space) and set in set_base_world.
+    void set_base_light_constants() {
+        const float colors[8] = {
+            environment_sun_red / 255.0f, environment_sun_green / 255.0f, environment_sun_blue / 255.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f};
+        set_vs_const("gDirLightColor", colors, 2);
+        const float ambient[4] = {
+            environment_ambient_red / 255.0f, environment_ambient_green / 255.0f, environment_ambient_blue / 255.0f, 1.0f};
+        set_vs_const("gAmbientColor", ambient, 1);
+    }
+
+    // Per-object base-shader constants: world-view-projection (transposed for the
+    // dp4-style vertex shader) and the sun direction transformed into the object's
+    // LOCAL space (the shader lights against the model-space normal). Local dir =
+    // worldToLight * transpose(world 3x3), normalised (handles rotation+scale).
+    void set_base_world(const D3DMATRIX& world) {
+        const D3DMATRIX wvp = transpose_matrix(multiply_matrix(world, view_projection_matrix));
+        set_vs_const("gWorldViewProjection", reinterpret_cast<const float*>(&wvp), 4);
+
+        const float wl[3] = {0.40452f, 0.86683f, -0.52009f};  // normalised world toLight (0.35,0.75,-0.45)
+        float local[8] = {
+            wl[0] * world._11 + wl[1] * world._12 + wl[2] * world._13,
+            wl[0] * world._21 + wl[1] * world._22 + wl[2] * world._23,
+            wl[0] * world._31 + wl[1] * world._32 + wl[2] * world._33,
+            0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        const float len = std::sqrt(local[0] * local[0] + local[1] * local[1] + local[2] * local[2]);
+        if (len > 0.0001f) {
+            local[0] /= len;
+            local[1] /= len;
+            local[2] /= len;
+        }
+        set_vs_const("gDirLightToLightDirL", local, 2);
+    }
+
+    // Switch the device to the base shader pipeline (decl + shaders); call
+    // set_base_light_constants once after this, then set_base_world per object.
+    void begin_base_shader() {
+        device->SetVertexDeclaration(world_decl);
+        device->SetVertexShader(base_vs);
+        device->SetPixelShader(base_ps);
+    }
+
+    // Return to the fixed-function pipeline for passes not yet ported.
+    void end_base_shader() {
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+    }
+
     void configure_render_state() {
         device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
         device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
@@ -1530,7 +1937,13 @@ struct GameWorldScene::Impl {
         device->SetRenderState(
             D3DRS_FOGCOLOR,
             D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue));
-        device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+        // Use PIXEL (table) fog, not vertex fog: vertex fog requires the vertex
+        // shader to output oFog, which the ported shaders don't, so shader-drawn
+        // geometry (terrain/objects/player) was getting an undefined fog factor
+        // and rendering solid fog-blue. Table fog is computed per-pixel from depth
+        // and works for both the fixed-function and shader passes.
+        device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+        device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
         DWORD fog_start = 0;
         DWORD fog_end = 0;
         std::memcpy(&fog_start, &config.fog_start, sizeof(fog_start));
@@ -1548,7 +1961,10 @@ struct GameWorldScene::Impl {
         light.Diffuse.r = static_cast<float>(environment_sun_red) / 255.0f;
         light.Diffuse.g = static_cast<float>(environment_sun_green) / 255.0f;
         light.Diffuse.b = static_cast<float>(environment_sun_blue) / 255.0f;
-        light.Ambient.r = light.Ambient.g = light.Ambient.b = 0.35f;
+        // Ambient comes solely from the global D3DRS_AMBIENT (the data-driven
+        // environment ambient). The old fixed 0.35 here double-counted ambient
+        // and washed the scene flat.
+        light.Ambient.r = light.Ambient.g = light.Ambient.b = 0.0f;
         light.Direction.x = -0.35f;
         light.Direction.y = -0.75f;
         light.Direction.z = 0.45f;
@@ -1720,10 +2136,15 @@ struct GameWorldScene::Impl {
                 if (normal_length <= 0.00001f) {
                     continue;
                 }
+                // Walkable (floor-facing) triangles — floors, slopes, ramps — are
+                // never collision walls: you stand/walk on them (support_height_at
+                // handles the height). Only steep faces (walls) block horizontal
+                // movement. Skipping only floors *below* the feet (the old check)
+                // made the slope above your feet block you, so ramps could only be
+                // jumped onto, not walked up.
                 const bool floor_facing =
                     std::abs(normal.y) / normal_length >= config.collision_floor_normal_threshold;
-                const float highest_point = (std::min)({a.y, b.y, c.y});
-                if (floor_facing && highest_point >= y - config.player_collision_radius) {
+                if (floor_facing) {
                     continue;
                 }
                 for (float offset = radius; offset < config.player_collision_height; offset += radius) {
@@ -1737,12 +2158,111 @@ struct GameWorldScene::Impl {
         return false;
     }
 
-    bool try_move_to(float x, float z) {
-        float ground_y = 0.0f;
-        if (!terrain_height_at(x, z, spawn_y, ground_y)) {
-            return false;
+    // True if (px,pz) is inside triangle (a,b,c) projected onto the XZ plane.
+    static bool point_in_triangle_xz(float px, float pz, const Vec3& a, const Vec3& b, const Vec3& c) {
+        const float d1 = (px - b.x) * (a.z - b.z) - (a.x - b.x) * (pz - b.z);
+        const float d2 = (px - c.x) * (b.z - c.z) - (b.x - c.x) * (pz - c.z);
+        const float d3 = (px - a.x) * (c.z - a.z) - (c.x - a.x) * (pz - a.z);
+        const bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+        const bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+        return !(neg && pos);
+    }
+
+    // Highest (smallest y, since world +y is down) solid floor-facing static
+    // surface directly above/below (x,z) within the y window [min_y, max_y].
+    // Lets the player stand on and walk up static objects (ramps, diagonal beams)
+    // the way the original's vertical collision rests the body on the world mesh.
+    bool static_floor_height_at(float x, float z, float min_y, float max_y, float& out_y,
+                                Vec3* out_normal = nullptr) const {
+        bool found = false;
+        float best = max_y;
+        Vec3 best_normal{0.0f, -1.0f, 0.0f};
+        for (const auto& instance : static_instances) {
+            if (x < instance.bounds_min.x || x > instance.bounds_max.x ||
+                z < instance.bounds_min.z || z > instance.bounds_max.z ||
+                instance.bounds_min.y > max_y || instance.bounds_max.y < min_y) {
+                continue;
+            }
+            const auto& positions = instance.resource->collision_positions;
+            const auto& indices = instance.resource->collision_indices;
+            for (std::size_t t = 0; t + 2 < indices.size(); t += 3) {
+                const Vec3 a = transform_point(positions[indices[t]], instance.world);
+                const Vec3 b = transform_point(positions[indices[t + 1]], instance.world);
+                const Vec3 c = transform_point(positions[indices[t + 2]], instance.world);
+                const Vec3 normal = cross(subtract(b, a), subtract(c, a));
+                const float len = std::sqrt(dot(normal, normal));
+                if (len <= 0.00001f || std::abs(normal.y) / len < config.collision_floor_normal_threshold) {
+                    continue;  // only walkable (floor-facing) triangles
+                }
+                if (!point_in_triangle_xz(x, z, a, b, c)) {
+                    continue;
+                }
+                // Plane height at (x,z): y = a.y - (nx*(x-a.x)+nz*(z-a.z))/ny.
+                const float y = a.y - (normal.x * (x - a.x) + normal.z * (z - a.z)) / normal.y;
+                if (y < min_y || y > max_y) {
+                    continue;
+                }
+                if (!found || y < best) {
+                    best = y;
+                    found = true;
+                    const float inv = 1.0f / len;
+                    best_normal = Vec3{normal.x * inv, normal.y * inv, normal.z * inv};
+                }
+            }
         }
+        if (found) {
+            out_y = best;
+            if (out_normal) {
+                *out_normal = best_normal;
+            }
+        }
+        return found;
+    }
+
+    // The support height at (x,z) for a body whose feet are at feet_y: the highest
+    // of the terrain and any static surface reachable by a step (up or down). +y
+    // is down, so "higher" = smaller y.
+    bool support_height_at(float x, float z, float feet_y, float& out_y, Vec3* out_normal = nullptr) const {
+        // Window centred on the FEET (step up or down). A surface only supports
+        // the body if it lies within this window — otherwise there is nothing to
+        // stand on here (the body should fall, not snap down to far-below terrain,
+        // which looked like falling through the model when standing on an object).
+        const float reach_up = feet_y - config.max_step_height;
+        const float reach_down = feet_y + config.max_step_height;
+        bool found = false;
+        float floor = 0.0f;
+        Vec3 normal{0.0f, -1.0f, 0.0f};
+        float terrain = 0.0f;
+        Vec3 terrain_normal{};
+        if (terrain_surface_at(x, z, terrain, terrain_normal) && terrain >= reach_up && terrain <= reach_down) {
+            floor = terrain;
+            normal = terrain_normal;
+            found = true;
+        }
+        float obj = 0.0f;
+        Vec3 obj_normal{};
+        if (static_floor_height_at(x, z, reach_up, reach_down, obj, &obj_normal) && (!found || obj < floor)) {
+            floor = obj;  // stand on the object surface (higher than terrain)
+            normal = obj_normal;
+            found = true;
+        }
+        if (found) {
+            out_y = floor;
+            if (out_normal) {
+                *out_normal = normal;
+            }
+        }
+        return found;
+    }
+
+    bool try_move_to(float x, float z) {
         if (grounded) {
+            // On the ground the body rests on the support surface (step up/down
+            // onto terrain or objects within max_step_height).
+            float ground_y = 0.0f;
+            if (!support_height_at(x, z, spawn_y, ground_y)) {
+                return false;
+            }
             if (std::abs(ground_y - spawn_y) > config.max_step_height ||
                 collides_with_static(x, ground_y, z)) {
                 return false;
@@ -1752,6 +2272,9 @@ struct GameWorldScene::Impl {
             spawn_z = z;
         } else {
             // Airborne: keep the jump-controlled height, just move horizontally.
+            // Do NOT require a support surface here — once you jump higher than a
+            // step the ground falls outside the support window, and requiring it
+            // would freeze all horizontal motion mid-air ("jump in place").
             if (collides_with_static(x, spawn_y, z)) {
                 return false;
             }
@@ -1763,20 +2286,63 @@ struct GameWorldScene::Impl {
 
     void jump() {
         if (grounded) {
-            velocity_y = kJumpImpulse;
+            velocity_y = config.jump_impulse;
             grounded = false;
         }
+    }
+
+    // Gravity drags the body down a steep floor while grounded (slide down a ramp
+    // when stopped). Uses the real floor normal: tangential gravity = G - (G·n)n
+    // with G = (0, gravity, 0) (+y is down); its horizontal part is the downhill
+    // direction, its magnitude g·sin(slope). Only floors steeper than the friction
+    // limit (config.slope_slide_normal_y) slide.
+    void apply_slope_slide(float delta_seconds) {
+        if (!grounded || delta_seconds <= 0.0f) {
+            return;
+        }
+        float floor_y = 0.0f;
+        Vec3 n{};
+        if (!support_height_at(spawn_x, spawn_z, spawn_y, floor_y, &n)) {
+            return;
+        }
+        const float ny = std::abs(n.y);
+        if (ny >= config.slope_slide_normal_y || ny <= 0.0001f) {
+            return;  // gentle enough to stand on (or degenerate)
+        }
+        const float g = config.jump_gravity;
+        const float tx = -g * n.y * n.x;
+        const float tz = -g * n.y * n.z;
+        const float hlen = std::sqrt(tx * tx + tz * tz);
+        if (hlen < 1e-4f) {
+            return;
+        }
+        const float speed = g * std::sqrt((std::max)(0.0f, 1.0f - ny * ny)) * config.slope_slide_factor;
+        const float disp = speed * delta_seconds;
+        try_move_to(spawn_x + (tx / hlen) * disp, spawn_z + (tz / hlen) * disp);
     }
 
     void update_vertical(float delta_seconds) {
         if (grounded || delta_seconds <= 0.0f) {
             return;
         }
-        velocity_y += kJumpGravity * delta_seconds;
+        velocity_y += config.jump_gravity * delta_seconds;
+        const float prev_y = spawn_y;
         spawn_y += velocity_y * delta_seconds;
-        float ground_y = 0.0f;
-        if (terrain_height_at(spawn_x, spawn_z, spawn_y, ground_y) && spawn_y >= ground_y) {
-            spawn_y = ground_y;
+        if (velocity_y < 0.0f) {
+            return;  // still rising (jump apex not reached); can't land
+        }
+        // Land on the highest surface (terrain or a static object) crossed during
+        // this descent, so you can land on top of objects, not only the terrain.
+        float floor = 0.0f;
+        bool found = terrain_height_at(spawn_x, spawn_z, spawn_y, floor);
+        float obj = 0.0f;
+        if (static_floor_height_at(spawn_x, spawn_z, prev_y - 0.05f, spawn_y + 0.05f, obj) &&
+            (!found || obj < floor)) {
+            floor = obj;
+            found = true;
+        }
+        if (found && spawn_y >= floor) {
+            spawn_y = floor;
             velocity_y = 0.0f;
             grounded = true;
         }
@@ -1811,13 +2377,23 @@ struct GameWorldScene::Impl {
             eye.y - std::sin(camera_pitch) * config.camera_look_distance,
             eye.z + std::cos(camera_yaw) * horizontal_distance,
         };
+        camera_eye = eye;
+        camera_target = target;
         const auto view = look_at_rh_matrix(eye, target, Vec3{0.0f, -1.0f, 0.0f});
         const auto projection = perspective_fov_rh_matrix(config.camera_fov * kPi / 180.0f, aspect, config.near_clip, config.far_clip);
+        view_matrix = view;
+        projection_matrix = projection;
+        view_projection_matrix = multiply_matrix(view, projection);
         device->SetTransform(D3DTS_VIEW, &view);
         device->SetTransform(D3DTS_PROJECTION, &projection);
     }
 
     void draw_terrain() {
+        // Terrain stays fixed-function: it needs the tile texture (uv0) modulated
+        // by the microtexture detail layer on a separate finer UV (uv1). The base
+        // shader samples only one texture/UV, so routing terrain through it lost
+        // the detail and made the ground a smeared single-tile texture. A faithful
+        // 2-UV terrain shader is a later step.
         device->SetFVF(kWorldVertexFvf);
         device->SetTexture(1, terrain_microtexture);
         device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 1);
@@ -1848,10 +2424,25 @@ struct GameWorldScene::Impl {
         device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
         device->SetRenderState(D3DRS_ALPHAREF, 0x20);
         device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-        device->SetFVF(kWorldVertexFvf);
+        // Static props stay double-sided (CULL_NONE, as the original): culling
+        // them broke foliage (leaf cards are single-sided geometry). Walking into
+        // a wall is prevented by collision, not by culling, so you never get
+        // inside a model to see its interior.
+        // Lit + textured via the original base shader pair (verified).
+        const bool use_shader = world_shaders_ready;
+        if (use_shader) {
+            begin_base_shader();
+            set_base_light_constants();
+        } else {
+            device->SetFVF(kWorldVertexFvf);
+        }
         for (const auto& instance : static_instances) {
             const auto* resource = instance.resource;
-            device->SetTransform(D3DTS_WORLD, &instance.world);
+            if (use_shader) {
+                set_base_world(instance.world);
+            } else {
+                device->SetTransform(D3DTS_WORLD, &instance.world);
+            }
             device->SetStreamSource(0, resource->vertex_buffer, 0, sizeof(WorldVertex));
             device->SetIndices(resource->index_buffer);
             for (const auto& batch : resource->batches) {
@@ -1865,6 +2456,9 @@ struct GameWorldScene::Impl {
                     batch.index_count / 3);
             }
         }
+        if (use_shader) {
+            end_base_shader();
+        }
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     }
 
@@ -1872,7 +2466,18 @@ struct GameWorldScene::Impl {
         device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
         device->SetRenderState(D3DRS_ALPHAREF, 0x20);
         device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-        device->SetFVF(kWorldVertexFvf);
+        // Lit + textured via the base shader (consistent with terrain/objects).
+        // The wind is still the CPU coherent-wave approximation applied to each
+        // instance's world matrix below; the original's per-vertex shader wind
+        // (VS 04_0x with gWindCircle/gMiniSinTable) needs grass geometry carrying
+        // per-vertex wind attributes (pivot/bend/phase/length), a separate task.
+        const bool use_shader = world_shaders_ready;
+        if (use_shader) {
+            begin_base_shader();
+            set_base_light_constants();
+        } else {
+            device->SetFVF(kWorldVertexFvf);
+        }
         for (const auto& instance : grass_instances) {
             const auto* resource = instance.resource;
             auto world = instance.world;
@@ -1883,16 +2488,30 @@ struct GameWorldScene::Impl {
             world._42 = 0.0f;
             world._43 = 0.0f;
             if (config.grass_quality == 2) {
+                // Coherent wind: a wave travels across the field along a fixed
+                // wind direction so neighbouring grass bends together in gusts
+                // (approximating the original's vertex-shader wind) instead of
+                // every blade shimmering at an independent random phase.
+                constexpr float kWindDirX = 0.70f;
+                constexpr float kWindDirZ = 0.71f;
+                constexpr float kSpatialFreq = 0.06f;  // radians per world unit
+                const float spatial = (x * kWindDirX + z * kWindDirZ) * kSpatialFreq;
+                const float t = elapsed_seconds * config.grass_wind_speed;
+                // Slow gust envelope so the wind swells and calms over the field.
+                const float gust = 0.55f + 0.45f * std::sin(t * 0.21f + spatial * 0.5f);
                 const float sway =
-                    std::sin(elapsed_seconds * config.grass_wind_speed + instance.wind_phase) *
-                    config.grass_wind_amplitude *
-                    instance.wind_scale;
+                    std::sin(t - spatial + instance.wind_phase * 0.12f) *
+                    config.grass_wind_amplitude * instance.wind_scale * gust;
                 world = multiply_matrix(world, rotation_z_matrix(sway));
             }
             world._41 = x;
             world._42 = y;
             world._43 = z;
-            device->SetTransform(D3DTS_WORLD, &world);
+            if (use_shader) {
+                set_base_world(world);
+            } else {
+                device->SetTransform(D3DTS_WORLD, &world);
+            }
             device->SetStreamSource(0, resource->vertex_buffer, 0, sizeof(WorldVertex));
             device->SetIndices(resource->index_buffer);
             for (const auto& batch : resource->batches) {
@@ -1905,6 +2524,9 @@ struct GameWorldScene::Impl {
                     batch.start_index,
                     batch.index_count / 3);
             }
+        }
+        if (use_shader) {
+            end_base_shader();
         }
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     }
@@ -1954,11 +2576,18 @@ struct GameWorldScene::Impl {
             }
         }
 
+        // clouds.dds is a DARK cloud texture (clouds = bright, clear sky = near
+        // black) meant to be ADDED over the sky-coloured background, not drawn
+        // opaque. The frame is already cleared to the sky colour (environment
+        // clear), so blend the tinted cloud texture additively: bright cloud
+        // texels brighten the blue sky into clouds, dark texels leave it blue.
         device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
         device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
         device->SetRenderState(D3DRS_FOGENABLE, FALSE);
         device->SetRenderState(D3DRS_LIGHTING, FALSE);
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
         device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
         device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
@@ -1981,6 +2610,227 @@ struct GameWorldScene::Impl {
         configure_render_state();
     }
 
+    // Representative water-surface Y for the planar-reflection plane: the height
+    // of the water-bearing patch nearest the camera (most water in a region sits
+    // at one level). Returns false when no water is visible.
+    bool water_plane(float& out_y) const {
+        bool found = false;
+        float best_d2 = 0.0f;
+        const float half = config.tile_size * 0.5f;
+        for (const auto& instance : instances) {
+            if (!instance.resource->has_water) {
+                continue;
+            }
+            const float cx = instance.origin_x + half;
+            const float cz = instance.origin_z + half;
+            const float dx = cx - spawn_x;
+            const float dz = cz - spawn_z;
+            const float d2 = dx * dx + dz * dz;
+            if (!found || d2 < best_d2) {
+                best_d2 = d2;
+                out_y = instance.resource->water_height;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    // Reflection strength for the current time of day (decoded FUN_004db5e0): the
+    // water lerps base colour↔reflection by this. 0 in full day (pure water colour),
+    // rises through dawn/dusk to the transition peak, moderate at deep night.
+    float water_reflect_coeff() const {
+        const float t = game_time_fraction;
+        float grad = 0.0f;
+        float mult = 0.0f;
+        if (t >= config.water_day_start && t <= config.water_day_end) {
+            grad = 0.0f;  // full day → no reflection
+            mult = 0.0f;
+        } else if (t <= config.water_night_before || t >= config.water_night_after) {
+            grad = 1.0f;  // deep night
+            mult = config.water_reflect_night;
+        } else if (t < config.water_day_start) {
+            grad = 1.0f - (t - config.water_night_before) / config.water_transition_width;  // dawn ramp
+            mult = config.water_reflect_transition;
+        } else {
+            grad = (t - config.water_day_end) / config.water_transition_width;  // dusk ramp
+            mult = config.water_reflect_transition;
+        }
+        return std::clamp(grad, 0.0f, 1.0f) * mult;
+    }
+
+    // Planar reflection (the original's reflection RT, FUN_004617a0/FUN_0047cc60):
+    // re-render sky + terrain + objects mirrored about the water plane into the
+    // reflection texture, which draw_water then projects onto the surface.
+    void render_reflection() {
+        if (config.water_reflection_enabled == 0 || !reflection_surface || !reflection_depth) {
+            return;
+        }
+        float water_y = 0.0f;
+        if (!water_plane(water_y)) {
+            return;
+        }
+        IDirect3DSurface9* prev_rt = nullptr;
+        IDirect3DSurface9* prev_depth = nullptr;
+        device->GetRenderTarget(0, &prev_rt);
+        device->GetDepthStencilSurface(&prev_depth);
+        device->SetRenderTarget(0, reflection_surface);
+        device->SetDepthStencilSurface(reflection_depth);
+        device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                      D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue),
+                      1.0f, 0);
+
+        // Mirror the camera across y = water_y (world +Y is down, so the up vector
+        // flips from -Y to +Y).
+        const Vec3 eye{camera_eye.x, 2.0f * water_y - camera_eye.y, camera_eye.z};
+        const Vec3 target{camera_target.x, 2.0f * water_y - camera_target.y, camera_target.z};
+        const D3DMATRIX saved_view = view_matrix;
+        const D3DMATRIX saved_vp = view_projection_matrix;
+        const auto view = look_at_rh_matrix(eye, target, Vec3{0.0f, 1.0f, 0.0f});
+        view_matrix = view;
+        view_projection_matrix = multiply_matrix(view, projection_matrix);
+        device->SetTransform(D3DTS_VIEW, &view);
+        // Reflection reverses triangle winding; force two-sided so nothing vanishes.
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+        rendering_reflection = true;
+        draw_sky();
+        draw_terrain();
+        draw_static_objects();
+        rendering_reflection = false;
+
+        // Restore the main camera + back buffer.
+        view_matrix = saved_view;
+        view_projection_matrix = saved_vp;
+        device->SetTransform(D3DTS_VIEW, &saved_view);
+        device->SetRenderTarget(0, prev_rt);
+        device->SetDepthStencilSurface(prev_depth);
+        release_com(prev_rt);
+        release_com(prev_depth);
+        configure_render_state();
+    }
+
+    // Per-frame wave displacement (FUN_0046a070): rewrite each water vertex's Y =
+    // (sin(phase)+amp)*scale + baseY, phase from world XZ (continuous across patches)
+    // + time. Locks the patch water VB and uploads the displaced positions.
+    void update_water_waves(TerrainResource* resource, float origin_x, float origin_z) {
+        if (!resource->water_vertex_buffer || resource->water_cpu_verts.empty() ||
+            config.wave_scale <= 0.0f) {
+            return;
+        }
+        const float kx = config.wave_freq_x / config.wave_cell_step;
+        const float kz = config.wave_freq_z / config.wave_cell_step;
+        const float time_phase = elapsed_seconds * config.wave_speed;
+        void* p = nullptr;
+        if (FAILED(resource->water_vertex_buffer->Lock(0, 0, &p, 0))) {
+            return;
+        }
+        auto* out = static_cast<WorldVertex*>(p);
+        for (std::size_t i = 0; i < resource->water_cpu_verts.size(); ++i) {
+            WorldVertex v = resource->water_cpu_verts[i];
+            const float phase = (origin_x + v.x) * kx + (origin_z + v.z) * kz + time_phase;
+            v.y = resource->water_height + (std::sin(phase) + config.wave_amp) * config.wave_scale;
+            out[i] = v;
+        }
+        resource->water_vertex_buffer->Unlock();
+    }
+
+    // Increment 1: translucent textured water surfaces from the .wtr grids,
+    // fixed-function (alpha-blended river texture, no depth write). The reflective
+    // shader (PS 01_00 + VS 03_00, env-cube + wave normals) is a later increment.
+    void draw_water() {
+        bool any = false;
+        for (const auto& instance : instances) {
+            if (instance.resource->water_index_count > 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any || !water_texture) {
+            return;
+        }
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(kWorldVertexFvf);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);   // blend over the scene, don't occlude
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(0xB0, 0xFF, 0xFF, 0xFF));
+        // Project the reflection only when the eye is ABOVE the water surface (world
+        // +Y is down → above means a smaller Y than the plane). From below/inside the
+        // water a sky reflection is meaningless and, on the plane's back face, appears
+        // to swing as the camera turns — so fall back to the flat texture there.
+        // Reflection is gated only by the REFLQUAL graphics option (native:
+        // FUN_0046a070 does the reflection pass when 0 < DAT_04f49a9c) + a valid RT.
+        const bool use_reflection =
+            config.water_reflection_enabled != 0 && reflection_texture != nullptr;
+        if (use_reflection) {
+            // Project the planar-reflection RT onto the surface: texcoord = the
+            // surface point's own screen position (the RT holds the mirrored scene
+            // at those same screen pixels). texMtx maps view-space pos → clip → [0,1].
+            const D3DMATRIX bias = {
+                0.5f,  0.0f,  0.0f, 0.0f,
+                0.0f, -0.5f,  0.0f, 0.0f,
+                0.0f,  0.0f,  1.0f, 0.0f,
+                0.5f,  0.5f,  0.0f, 1.0f,
+            };
+            const D3DMATRIX tex_mtx = multiply_matrix(projection_matrix, bias);
+            device->SetTransform(D3DTS_TEXTURE0, &tex_mtx);
+            device->SetTexture(0, reflection_texture);
+            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            // Blend reflection ↔ the water's own colour by the time-of-day reflect
+            // coefficient (decoded FUN_004db5e0): result = k*reflection + (1-k)*base.
+            // Base colour = the environment sky/clear colour (data-driven, Sky.txt) —
+            // a stand-in for the native Fresnel gradient until step 4 (the shader).
+            const int k = std::clamp(static_cast<int>(water_reflect_coeff() * 255.0f + 0.5f), 0, 255);
+            device->SetTextureStageState(0, D3DTSS_CONSTANT,
+                D3DCOLOR_ARGB(k, environment_clear_red, environment_clear_green, environment_clear_blue));
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_LERP);
+            device->SetTextureStageState(0, D3DTSS_COLORARG0, D3DTA_CONSTANT | D3DTA_ALPHAREPLICATE);  // k
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);                          // reflection
+            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CONSTANT);                         // base water colour
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);  // constant translucency
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        } else {
+            device->SetTexture(0, water_texture);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);  // constant translucency
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        }
+        for (const auto& instance : instances) {
+            auto* resource = instance.resource;
+            if (resource->water_index_count == 0) {
+                continue;
+            }
+            update_water_waves(resource, instance.origin_x, instance.origin_z);
+            const auto world = translation_matrix(instance.origin_x, 0.0f, instance.origin_z);
+            device->SetTransform(D3DTS_WORLD, &world);
+            device->SetStreamSource(0, resource->water_vertex_buffer, 0, sizeof(WorldVertex));
+            device->SetIndices(resource->water_index_buffer);
+            device->DrawIndexedPrimitive(
+                D3DPT_TRIANGLELIST, 0, 0, resource->water_vertex_count, 0, resource->water_index_count / 3);
+        }
+        if (use_reflection) {
+            // Undo the projective texture transform so later passes are unaffected.
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        }
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+        configure_render_state();  // restore the shared (shader-era) render state
+    }
+
     void draw_player() {
         if (!player_vertex_buffer || !player_index_buffer || player_batches.empty()) {
             return;
@@ -1993,8 +2843,17 @@ struct GameWorldScene::Impl {
         world._41 = spawn_x - std::sin(camera_yaw) * player_body_shift;
         world._42 = spawn_y;
         world._43 = spawn_z - std::cos(camera_yaw) * player_body_shift;
-        device->SetTransform(D3DTS_WORLD, &world);
-        device->SetFVF(kWorldVertexFvf);
+        const bool use_shader = world_shaders_ready;
+        if (use_shader) {
+            // The body is already skinned to world-posed vertices on the CPU, so
+            // the base lit+textured shader applies like any static object.
+            begin_base_shader();
+            set_base_light_constants();
+            set_base_world(world);
+        } else {
+            device->SetTransform(D3DTS_WORLD, &world);
+            device->SetFVF(kWorldVertexFvf);
+        }
         device->SetStreamSource(0, player_vertex_buffer, 0, sizeof(WorldVertex));
         device->SetIndices(player_index_buffer);
         // Backface-cull the body so looking down does not reveal the dark
@@ -2011,6 +2870,9 @@ struct GameWorldScene::Impl {
                 batch.index_count / 3);
         }
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        if (use_shader) {
+            end_base_shader();
+        }
     }
 
     void draw_overlay() {
@@ -2072,9 +2934,17 @@ struct GameWorldScene::Impl {
         if (!create_device(error)) {
             return false;
         }
+        create_reflection_target();
+        load_world_shaders();
         try {
             terrain_microtexture = load_mtx_texture(device, root_path / config.terrain_microtexture);
             sky_texture = load_dds_texture(device, root_path / config.sky_texture);
+            {  // water surface texture (animated river frame; static for now)
+                const auto wpath = root_path / "landscape" / "river1a_00.dds";
+                if (std::filesystem::exists(wpath)) {
+                    water_texture = load_dds_texture(device, wpath);
+                }
+            }
             load_visible_terrain();
             snap_to_ground();
             load_visible_grass();
@@ -2127,6 +2997,14 @@ struct GameWorldScene::Impl {
         overlay_width = width;
         overlay_height = height;
         return true;
+    }
+
+    void set_fog(float start, float end) {
+        config.fog_start = start;
+        config.fog_end = end;
+        if (device) {
+            configure_render_state();
+        }
     }
 
     bool set_grass_quality(int quality, std::wstring& error) {
@@ -2216,25 +3094,48 @@ struct GameWorldScene::Impl {
         const float forward = (input.forward ? 1.0f : 0.0f) - (input.backward ? 1.0f : 0.0f);
         const float right = (input.strafe_right ? 1.0f : 0.0f) - (input.strafe_left ? 1.0f : 0.0f);
         const float input_length = std::sqrt(forward * forward + right * right);
-        update_player_animation(delta_seconds, input_length > 0.0001f, input.run);
+        const bool moving = input_length > 0.0001f && delta_seconds > 0.0f;
+        update_player_animation(delta_seconds, moving, input.run);
         update_vertical(delta_seconds);
-        if (input_length <= 0.0001f || delta_seconds <= 0.0f) {
+
+        // ControlMove keeps the own character and camera facing the same way.
+        spawn_angle = -camera_yaw;
+
+        // Velocity-based movement, matching the original ControlMove: every frame
+        // the horizontal speed g_85B8 is reset to 0 and re-derived from the held
+        // movement keys, then the engine integrates it (the jump only sets the
+        // vertical field 0x28C, never the horizontal). So there is no momentum/glide
+        // — releasing the keys stops you, even mid-air — but holding a direction
+        // through a jump keeps carrying you forward (that is the "inertia").
+        if (moving) {
+            const float normalized_forward = forward / input_length;
+            const float normalized_right = right / input_length;
+            const float speed = config.walk_speed * (input.run ? config.run_multiplier : 1.0f);
+            velocity_x = (std::sin(camera_yaw) * normalized_forward +
+                          std::cos(camera_yaw) * normalized_right) * speed;
+            velocity_z = (std::cos(camera_yaw) * normalized_forward -
+                          std::sin(camera_yaw) * normalized_right) * speed;
+        } else {
+            velocity_x = 0.0f;
+            velocity_z = 0.0f;
+            if (grounded) {
+                // Standing still on a steep floor: gravity drags you downhill (the
+                // only time the auto-slide applies, so it never fights a climb).
+                apply_slope_slide(delta_seconds);
+            }
             return true;
         }
 
-        const float normalized_forward = forward / input_length;
-        const float normalized_right = right / input_length;
-        const float speed = config.walk_speed * (input.run ? config.run_multiplier : 1.0f);
-        const float move_x =
-            std::sin(camera_yaw) * normalized_forward +
-            std::cos(camera_yaw) * normalized_right;
-        const float move_z =
-            std::cos(camera_yaw) * normalized_forward -
-            std::sin(camera_yaw) * normalized_right;
-        const float distance = speed * delta_seconds;
+        if (delta_seconds <= 0.0f) {
+            return true;
+        }
+
+        const float disp_x = velocity_x * delta_seconds;
+        const float disp_z = velocity_z * delta_seconds;
+        const float distance = std::sqrt(disp_x * disp_x + disp_z * disp_z);
         const int movement_steps = (std::max)(1, static_cast<int>(std::ceil(distance / config.movement_collision_step)));
-        const float step_x = move_x * distance / static_cast<float>(movement_steps);
-        const float step_z = move_z * distance / static_cast<float>(movement_steps);
+        const float step_x = disp_x / static_cast<float>(movement_steps);
+        const float step_z = disp_z / static_cast<float>(movement_steps);
         for (int step = 0; step < movement_steps; ++step) {
             const float previous_x = spawn_x;
             const float previous_z = spawn_z;
@@ -2248,8 +3149,6 @@ struct GameWorldScene::Impl {
                 break;
             }
         }
-        // ControlMove keeps the own character and camera facing the same way.
-        spawn_angle = -camera_yaw;
 
         const int center_row = static_cast<int>(std::floor(spawn_x / config.tile_size)) + config.origin_row;
         const int center_column = config.origin_column - static_cast<int>(std::floor(spawn_z / config.tile_size));
@@ -2302,7 +3201,12 @@ struct GameWorldScene::Impl {
             return;
         }
         fill_present_parameters();
+        // Default-pool resources must be released before Reset and remade after.
+        release_com(reflection_depth);
+        release_com(reflection_surface);
+        release_com(reflection_texture);
         if (SUCCEEDED(device->Reset(&present))) {
+            create_reflection_target();
             configure_render_state();
         }
     }
@@ -2320,19 +3224,21 @@ struct GameWorldScene::Impl {
             return;
         }
         update_view_projection();
-        device->Clear(
-            0,
-            nullptr,
-            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-            D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue),
-            1.0f,
-            0);
         if (SUCCEEDED(device->BeginScene())) {
+            render_reflection();  // mirrored scene into the reflection RT (restores back buffer + main view)
+            device->Clear(
+                0,
+                nullptr,
+                D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue),
+                1.0f,
+                0);
             draw_sky();
             draw_terrain();
             draw_grass();
             draw_static_objects();
             draw_player();
+            draw_water();  // translucent, after opaque geometry
             draw_overlay();
             device->EndScene();
         }
@@ -2362,6 +3268,10 @@ bool GameWorldScene::set_overlay_bitmap(int width, int height, std::vector<std::
 
 bool GameWorldScene::set_grass_quality(int quality, std::wstring& error) {
     return impl_->set_grass_quality(quality, error);
+}
+
+void GameWorldScene::set_fog(float start, float end) {
+    impl_->set_fog(start, end);
 }
 
 void GameWorldScene::set_game_time(float day_fraction) {

@@ -894,6 +894,24 @@ void apply_grass_quality() {
     }
 }
 
+// Map the "Туман" (FOGDIST, 30..200) graphics setting to linear fog distances.
+// fog_end is the configured distance; fog starts ~40% out so there is a haze
+// band before full fog. The slider drives this live (см. apply_fog_distance).
+void fog_range_for_distance(int fog_distance, float& start, float& end) {
+    end = static_cast<float>(fog_distance);
+    start = static_cast<float>(fog_distance) * 0.4f;
+}
+
+void apply_fog_distance() {
+    if (!g_app->game_scene) {
+        return;
+    }
+    float start = 0.0f;
+    float end = 0.0f;
+    fog_range_for_distance(g_app->settings.fog_distance, start, end);
+    g_app->game_scene->set_fog(start, end);
+}
+
 std::wstring resolve_text(const sphere::client::UiControlDef& def) {
     if (def.text_key.empty()) {
         return {};
@@ -1447,13 +1465,16 @@ void draw_sprite_rotated_centered(HDC dc, const sphere::client::UiWindowDef& win
 double clock_hand_angle(int control_id, float day_fraction) {
     float frac = day_fraction - std::floor(day_fraction);
     const int total = static_cast<int>(frac * 86400.0f) % 86400;
-    const int seconds = total % 60;
     const int minutes = (total / 60) % 60;
     const int hours = (total / 3600) % 24;
     if (control_id == 11) {
         return (hours / 12.0 + minutes / 720.0) * 360.0;
     }
-    return (minutes / 60.0 + seconds / 240.0) * 360.0;
+    // get_time_field(1) is the raw seconds nibble (server sends Second/12+1 = 1..5),
+    // NOT real seconds 0-59. So the minute-hand smoothing term is tiny (<=7.5deg);
+    // using 0-59 here produced an ~88deg/min sawtooth. Replicate the 1..5 index.
+    const int sec_index = (total % 60) / 12 + 1;
+    return (minutes / 60.0 + sec_index / 240.0) * 360.0;
 }
 
 void draw_sprite(HDC dc, const std::wstring& sprite_name, int x, int y) {
@@ -2469,6 +2490,7 @@ void activate_game_control(HWND hwnd, int window_index, int control_id, POINT pt
                 g_app->settings.fog_distance = direction == 0
                     ? 30 + static_cast<int>(std::round(ratio * 170.0))
                     : std::clamp(g_app->settings.fog_distance + direction * control->delta_step, 30, 200);
+                apply_fog_distance();  // live-update the world fog as the slider moves
             } else if (control_id == 46) {
                 g_app->settings.lod_distance = direction == 0
                     ? static_cast<int>(std::round(ratio * 200.0))
@@ -3621,6 +3643,8 @@ bool enter_game_mode(HWND hwnd, const PostedCharacterActionResult& posted) {
     std::wstring error;
     auto world_config = g_app->lua_boot.game_window;
     world_config.grass_quality = g_app->settings.grass_quality;
+    world_config.water_reflection_enabled = g_app->settings.reflection_quality > 0 ? 1 : 0;  // REFLQUAL graphics option
+    fog_range_for_distance(g_app->settings.fog_distance, world_config.fog_start, world_config.fog_end);
     if (!scene->initialize(
             hwnd,
             g_app->settings.root,
@@ -3687,6 +3711,8 @@ bool enter_debug_game_mode(HWND hwnd) {
     std::wstring error;
     auto world_config = g_app->lua_boot.game_window;
     world_config.grass_quality = g_app->settings.grass_quality;
+    world_config.water_reflection_enabled = g_app->settings.reflection_quality > 0 ? 1 : 0;  // REFLQUAL graphics option
+    fog_range_for_distance(g_app->settings.fog_distance, world_config.fog_start, world_config.fog_end);
     if (!scene->initialize(
             hwnd,
             g_app->settings.root,
@@ -4006,6 +4032,22 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         }
         if (g_app->mode == AppMode::Game) {
             g_app->game_pressed_mouse = pt;
+            // Live slider drag: while a Scroll_Bar is held, track the mouse so the
+            // value follows the thumb (previously sliders only moved on click).
+            if (g_app->game_pressed_window_index >= 0 &&
+                g_app->game_pressed_window_index < static_cast<int>(g_app->game_windows.size()) &&
+                g_app->game_pressed_control_id > 0) {
+                const auto& pressed_window =
+                    g_app->game_windows[static_cast<std::size_t>(g_app->game_pressed_window_index)];
+                for (const auto& c : pressed_window.controls) {
+                    if (c.id == g_app->game_pressed_control_id &&
+                        (class_is(c, L"Scroll_Bar") || class_is(c, L"SCROLL_BAR"))) {
+                        activate_game_control(hwnd, g_app->game_pressed_window_index, c.id, pt);
+                        update_game_overlay(hwnd);
+                        return 0;
+                    }
+                }
+            }
             if (g_app->ui_drag_kind == UiDragKind::Game) {
                 const int index = g_app->ui_drag_game_window_index;
                 if (index >= 0 && index < static_cast<int>(g_app->game_windows.size())) {
