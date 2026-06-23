@@ -532,8 +532,16 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "grass_flatness_threshold", 0.0, 20.0, out.grass_flatness_threshold, error) &&
         read_game_number_field(state, config_index, "grass_flatness_normal_y", 0.0, 1.0, out.grass_flatness_normal_y, error) &&
         read_game_number_field(state, config_index, "grass_generation_margin", 1.0, 100.0, out.grass_generation_margin, error) &&
-        read_game_number_field(state, config_index, "grass_wind_amplitude", 0.0, 0.5, out.grass_wind_amplitude, error) &&
+        read_game_number_field(state, config_index, "grass_wind_amplitude", 0.0, 8.0, out.grass_wind_amplitude, error) &&
         read_game_number_field(state, config_index, "grass_wind_speed", 0.0, 20.0, out.grass_wind_speed, error) &&
+        read_game_number_field(state, config_index, "tree_wind_amplitude", 0.0, 20.0, out.tree_wind_amplitude, error) &&
+        read_game_number_field(state, config_index, "tree_wind_speed", 0.0, 20.0, out.tree_wind_speed, error) &&
+        read_game_number_field(state, config_index, "grass_glow", 0.0, 1.0, out.grass_glow, error) &&
+        read_game_number_field(state, config_index, "grass_color_gain", 0.5, 4.0, out.grass_color_gain, error) &&
+        read_game_number_field(state, config_index, "grass_fade_start", 0.0, 1000.0, out.grass_fade_start, error) &&
+        read_game_number_field(state, config_index, "grass_fade_end", 0.0, 1000.0, out.grass_fade_end, error) &&
+        read_game_number_field(state, config_index, "grass_gust_radius_scale", 0.01, 1.0, out.grass_gust_radius_scale, error) &&
+        read_game_number_field(state, config_index, "grass_breeze", 0.0, 2.0, out.grass_breeze, error) &&
         read_game_string_field(state, config_index, "sky_texture", out.sky_texture, error) &&
         read_game_number_field(state, config_index, "sky_radius", 10.0, 10000.0, out.sky_radius, error) &&
         read_game_number_field(state, config_index, "sky_height_scale", 0.1, 5.0, out.sky_height_scale, error) &&
@@ -575,6 +583,12 @@ bool load_game_window_config(lua_State* state, LuaGameWindowConfig& out, std::ws
         read_game_number_field(state, config_index, "wave_cell_step", 0.1, 1000.0, out.wave_cell_step, error) &&
         read_game_number_field(state, config_index, "wave_speed", 0.0, 100.0, out.wave_speed, error) &&
         read_game_integer_field(state, config_index, "water_reflection_enabled", 0, 1, out.water_reflection_enabled, error) &&
+        read_game_integer_field(state, config_index, "water_deep_r", 0, 255, out.water_deep_r, error) &&
+        read_game_integer_field(state, config_index, "water_deep_g", 0, 255, out.water_deep_g, error) &&
+        read_game_integer_field(state, config_index, "water_deep_b", 0, 255, out.water_deep_b, error) &&
+        read_game_integer_field(state, config_index, "water_graze_r", 0, 255, out.water_graze_r, error) &&
+        read_game_integer_field(state, config_index, "water_graze_g", 0, 255, out.water_graze_g, error) &&
+        read_game_integer_field(state, config_index, "water_graze_b", 0, 255, out.water_graze_b, error) &&
         read_game_integer_field(state, config_index, "position_send_interval_ms", 10, 10000, out.position_send_interval_ms, error) &&
         read_game_number_field(state, config_index, "near_clip", 0.001, 100.0, out.near_clip, error) &&
         read_game_number_field(state, config_index, "far_clip", 10.0, 10000.0, out.far_clip, error) &&

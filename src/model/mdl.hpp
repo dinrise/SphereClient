@@ -88,6 +88,13 @@ struct MdlTransformKey {
     float qz = 0.0f;
 };
 
+// Compressed animation key (skin_indices_0x03, 3 bytes): an index into transform_keys plus
+// a blend byte toward the next record (0 = exact record, 0xff = also exact, no next).
+struct MdlSkinIndex {
+    std::uint16_t record = 0;
+    std::uint8_t blend = 0;
+};
+
 struct MdlBounds {
     float min_x = 0.0f;
     float min_y = 0.0f;
@@ -105,6 +112,7 @@ struct MdlMesh {
     std::vector<MdlObject> objects;
     std::vector<std::uint8_t> object_indices;
     std::vector<MdlTransformKey> transform_keys;
+    std::vector<MdlSkinIndex> skin_indices;
     std::vector<std::uint16_t> actions;
     MdlBounds bounds;
 };

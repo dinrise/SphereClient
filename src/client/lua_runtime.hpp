@@ -107,6 +107,25 @@ struct LuaGameWindowConfig {
     float grass_generation_margin = 0.0f;
     float grass_wind_amplitude = 0.0f;
     float grass_wind_speed = 0.0f;
+    // Tree/foliage sway (tree-wind VS): amplitude in world units at the leaf tips.
+    float tree_wind_amplitude = 0.0f;
+    float tree_wind_speed = 0.0f;
+    // Grass "glow": the original lights grass with its own bright material rig
+    // (FUN_00469090 sets fixed light dirs/colours into the u_grass material), and
+    // the per-cell colour is brightened through per-channel LUTs (FUN_0047a150 +0x134),
+    // so grass stays luminous independent of the dim time-of-day sun.
+    float grass_glow = 0.0f;        // self-illumination floor (0..1): min brightness regardless of sun
+    float grass_color_gain = 1.0f;  // brighten gain applied to the baked ground-colour tint
+    // Distance grow/dissolve (FUN_00477020): grass grows from the ground + alpha-fades
+    // between these distances (just inside the generation radius) so it appears/recedes
+    // smoothly instead of popping when a new cell batch is baked.
+    float grass_fade_start = 0.0f;  // within this distance: full height/opacity
+    float grass_fade_end = 0.0f;    // beyond this distance: collapsed to ground + invisible
+    // WindCircle gusts (native VS04 field): grass is pressed hard inside the 6 drifting
+    // circles, calm elsewhere. grass_gust_radius_scale = 1/radius (0.2 native ≈ radius 5u;
+    // smaller = bigger visible circles); grass_breeze = calm ever-present sway amount.
+    float grass_gust_radius_scale = 0.2f;
+    float grass_breeze = 0.3f;
     std::wstring camera_mode;
     std::wstring sky_texture;
     float sky_radius = 0.0f;
@@ -153,6 +172,10 @@ struct LuaGameWindowConfig {
     float wave_cell_step = 8.33f; // _DAT_00504038 (= tile_size/12)
     float wave_speed = 1.5f;      // time→phase rad/s (orig = DAT_04eb9cd0*pi/16; counter rate not extracted → tunable)
     int water_reflection_enabled = 1;  // 0 = flat time-coloured water only (no planar reflection)
+    // Water body colour (Fresnel gradient endpoints), matched to the original's
+    // turquoise lake. deep = looking straight down, graze = toward the horizon.
+    int water_deep_r = 30, water_deep_g = 95, water_deep_b = 105;
+    int water_graze_r = 70, water_graze_g = 150, water_graze_b = 165;
     int position_send_interval_ms = 0;
     float near_clip = 0.0f;
     float far_clip = 0.0f;

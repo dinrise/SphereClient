@@ -2,6 +2,7 @@
 
 #include "client/skinned_character.hpp"
 #include "common/binary_reader.hpp"
+#include "common/params_config.hpp"
 #include "model/mdl.hpp"
 
 #include <d3d9.h>
@@ -104,6 +105,11 @@ struct TerrainResource {
     float water_height = 0.0f;   // representative water-surface Y for this patch (planar-reflection plane)
     bool has_water = false;
     std::vector<WorldVertex> water_cpu_verts;  // base water verts (for per-frame wave Y displacement)
+    // CPU copy of the patch texture (R5G6B5) so grass can be tinted by the ground
+    // colour beneath it, as the original does (FUN_0046d270 samples the patch .dds).
+    std::vector<std::uint16_t> tex_pixels;
+    int tex_w = 0;
+    int tex_h = 0;
 };
 
 struct TerrainInstance {
@@ -134,6 +140,40 @@ struct StaticModelResource {
     std::vector<std::uint16_t> collision_indices;
     Vec3 bounds_min{};
     Vec3 bounds_max{};
+    // CPU geometry (kept so grass can be baked into combined world-space batches).
+    std::vector<WorldVertex> cpu_vertices;
+    std::vector<std::uint16_t> cpu_indices;
+    // True for skinned (animated) MDL characters (NPCs): they are posed via the bone skeleton
+    // and need to be snapped to the terrain (the .mbd Y is not their exact ground contact).
+    bool is_skinned = false;
+    // Per-frame animation data (skinned only): the BIND mesh (bone-local, with skeleton +
+    // skin_indices) is kept so the VB can be re-posed each animation frame; world_template is
+    // the WorldVertex array whose pos/normal are overwritten per frame (uv/colour stay).
+    sphere::model::MdlMesh bind_mesh;
+    std::vector<WorldVertex> world_template;
+    int frame_count = 1;
+    int last_anim_frame = -1;  // cache so the VB is only re-posed when the frame changes
+    // Animation clips: per-clip [start,len) within a bone key block, from the MDL "actions"
+    // (skin_weights_0x02) cumulative offsets. idle_clip = FREE; gesture_clips = FREE1/2/3.
+    std::vector<int> clip_start;
+    std::vector<int> clip_len;
+    int idle_clip = -1;
+    std::vector<int> gesture_clips;
+    // Animation state machine (per resource; all instances of a model animate in sync — the
+    // original's _char FreeAn: loop the idle clip, occasionally play a random gesture once).
+    int cur_clip = -1;       // currently playing clip (idle when == idle_clip)
+    float clip_time = 0.0f;  // seconds into the current clip
+};
+
+// One combined, world-space-baked grass draw batch (all grass sharing a texture
+// merged into one VB/IB so thousands of tufts cost a handful of draw calls — the
+// original merges per-cell grass into a single mesh, FUN_0047a150's grass1_21).
+struct GrassRenderBatch {
+    IDirect3DTexture9* texture = nullptr;
+    IDirect3DVertexBuffer9* vertex_buffer = nullptr;
+    IDirect3DIndexBuffer9* index_buffer = nullptr;
+    UINT vertex_count = 0;
+    UINT index_count = 0;
 };
 
 struct StaticPlacement {
@@ -160,6 +200,7 @@ struct GrassInstance {
     float wind_scale = 1.0f;
     int cell_x = 0;
     int cell_z = 0;
+    DWORD tint = 0xffffffff;  // ground colour beneath the tuft (grass vertex tint)
 };
 
 template <typename T>
@@ -295,6 +336,196 @@ D3DMATRIX multiply_matrix(const D3DMATRIX& left, const D3DMATRIX& right) {
         }
     }
     return out;
+}
+
+// Bone transform from a quaternion (w,x,y,z) + translation, matching the original .mdl
+// skeleton path EXACTLY (verified live via the debugger): FUN_0044bb80 builds the column-vector
+// rotation R (factor 2.0) and FUN_00454ff0 assembles a 4x4 whose upper block is R laid out
+// column-wise with the translation in the last COLUMN (_14/_24/_34). So this is the
+// column-vector convention: a point transforms as v' = M*v (translation last column), and the
+// hierarchy composes as world = parent*local. The ground-truth bone matrices read from the
+// running original match this layout (translation = world position in the last column).
+D3DMATRIX quat_translation_matrix(float w, float x, float y, float z,
+                                  float tx, float ty, float tz) {
+    const float xx = x * x, yy = y * y, zz = z * z;
+    const float xy = x * y, xz = x * z, yz = y * z;
+    const float wx = w * x, wy = w * y, wz = w * z;
+    // R0..R8 = FUN_0044bb80's output param_2[0..8] (standard column-vector rotation for q).
+    const float R0 = 1.0f - 2.0f * (yy + zz), R1 = 2.0f * (xy - wz),        R2 = 2.0f * (wy + xz);
+    const float R3 = 2.0f * (wz + xy),        R4 = 1.0f - 2.0f * (xx + zz), R5 = 2.0f * (yz - wx);
+    const float R6 = 2.0f * (xz - wy),        R7 = 2.0f * (yz + wx),        R8 = 1.0f - 2.0f * (xx + yy);
+    D3DMATRIX m{};
+    m._11 = R0; m._12 = R3; m._13 = R6; m._14 = tx;
+    m._21 = R1; m._22 = R4; m._23 = R7; m._24 = ty;
+    m._31 = R2; m._32 = R5; m._33 = R8; m._34 = tz;
+    m._41 = 0.0f; m._42 = 0.0f; m._43 = 0.0f; m._44 = 1.0f;
+    return m;
+}
+
+// Pose a SKINNED MDL (NPCs/creatures) into its rest pose. Each MDL "object" is a bone:
+// its rest local transform = transform_keys[object.key_index] (pos + quat, frame 0 of the
+// bone's keyframe block); the hierarchy is the object_indices child lists
+// ([object_index_offset .. +connected_bone_count]); world = local * parent. Each surface
+// is rigidly bound to one bone (surface.object_index) and its verts are bone-local, so we
+// bake them by that bone's world matrix — exactly what the original does (FUN_00454ff0
+// builds the bone matrices, FUN_00477fb0/FUN_00477020 draw the bone-local verts posed).
+// Non-skinned props (no skin data) are left untouched. Returns true if it posed the mesh.
+bool apply_mdl_rest_pose(sphere::model::MdlMesh& mesh, int frame = 0) {
+    const auto bone_count = mesh.objects.size();
+    if (mesh.info.skin_weight_count == 0 || bone_count == 0 || mesh.transform_keys.empty()) {
+        return false;  // a plain static prop — bind verts are already model-space
+    }
+
+    // Each bone's local transform for animation frame F (frame 0 = rest). STATIC bones
+    // (is_animated == 0) read transform_keys[key_index] directly; ANIMATED bones read the
+    // compressed key stream skin_indices[key_index + F] → (record, blend) and lerp/slerp
+    // skin_records[record]..[record+1]. This is FUN_00454ff0's two branches and matches the
+    // bone matrices read live from the original (avg 0.07 vs ground truth at frame 0).
+    auto bone_local = [&](std::size_t b, D3DMATRIX& out) -> bool {
+        const auto& obj = mesh.objects[b];
+        sphere::model::MdlTransformKey k;
+        if (obj.is_animated == 0) {
+            const std::size_t key = static_cast<std::size_t>(obj.key_index);
+            if (key >= mesh.transform_keys.size()) {
+                return false;
+            }
+            k = mesh.transform_keys[key];
+        } else {
+            const std::size_t idx = static_cast<std::size_t>(obj.key_index) + static_cast<std::size_t>(frame);
+            if (idx >= mesh.skin_indices.size()) {
+                return false;
+            }
+            const auto entry = mesh.skin_indices[idx];
+            const std::size_t r = entry.record;
+            if (r >= mesh.transform_keys.size()) {
+                return false;
+            }
+            const auto& a = mesh.transform_keys[r];
+            if (entry.blend == 0 || entry.blend == 0xff || r + 1 >= mesh.transform_keys.size()) {
+                k = a;
+            } else {
+                const float t = static_cast<float>(entry.blend) / 255.0f;
+                const auto& b1 = mesh.transform_keys[r + 1];
+                k.x = a.x + (b1.x - a.x) * t;
+                k.y = a.y + (b1.y - a.y) * t;
+                k.z = a.z + (b1.z - a.z) * t;
+                const float dot = a.qw * b1.qw + a.qx * b1.qx + a.qy * b1.qy + a.qz * b1.qz;
+                const float s = dot < 0.0f ? -1.0f : 1.0f;
+                float qw = a.qw + (b1.qw * s - a.qw) * t, qx = a.qx + (b1.qx * s - a.qx) * t;
+                float qy = a.qy + (b1.qy * s - a.qy) * t, qz = a.qz + (b1.qz * s - a.qz) * t;
+                const float len = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+                const float inv = len > 1e-8f ? 1.0f / len : 1.0f;
+                k.qw = qw * inv; k.qx = qx * inv; k.qy = qy * inv; k.qz = qz * inv;
+            }
+        }
+        out = quat_translation_matrix(k.qw, k.qx, k.qy, k.qz, k.x, k.y, k.z);
+        return true;
+    };
+    std::vector<D3DMATRIX> local(bone_count, identity_matrix());
+    for (std::size_t i = 0; i < bone_count; ++i) {
+        if (!bone_local(i, local[i])) {
+            return false;  // unexpected layout — don't risk a broken pose
+        }
+    }
+
+    // Roots = objects that are no one's child. Compose world matrices down the tree.
+    std::vector<char> is_child(bone_count, 0);
+    auto children_of = [&](std::size_t i, auto&& fn) {
+        const auto& obj = mesh.objects[i];
+        for (int c = 0; c < obj.connected_bone_count; ++c) {
+            const std::size_t idx = static_cast<std::size_t>(obj.object_index_offset) + c;
+            if (idx < mesh.object_indices.size()) {
+                const std::uint8_t child = mesh.object_indices[idx];
+                if (child < bone_count) {
+                    fn(static_cast<std::size_t>(child));
+                }
+            }
+        }
+    };
+    for (std::size_t i = 0; i < bone_count; ++i) {
+        children_of(i, [&](std::size_t child) { is_child[child] = 1; });
+    }
+
+    std::vector<D3DMATRIX> world(bone_count, identity_matrix());
+    std::vector<char> done(bone_count, 0);
+    std::vector<std::pair<std::size_t, D3DMATRIX>> stack;
+    const D3DMATRIX root_parent = identity_matrix();
+    for (std::size_t i = 0; i < bone_count; ++i) {
+        if (is_child[i]) {
+            continue;
+        }
+        stack.push_back({i, root_parent});
+        while (!stack.empty()) {
+            const auto [bone, parent] = stack.back();
+            stack.pop_back();
+            if (done[bone]) {
+                continue;
+            }
+            world[bone] = multiply_matrix(parent, local[bone]);  // column-vector: world = parent * local
+            done[bone] = 1;
+            children_of(bone, [&](std::size_t child) {
+                if (!done[child]) {
+                    stack.push_back({child, world[bone]});
+                }
+            });
+        }
+    }
+
+    // Each vertex belongs to exactly one surface → one bone; transform pos + normal.
+    std::vector<int> vertex_bone(mesh.vertices.size(), -1);
+    for (const auto& surface : mesh.surfaces) {
+        if (surface.first_vertex_index < 0 || surface.vertex_count < 0) {
+            continue;
+        }
+        const std::size_t bone = static_cast<std::size_t>(surface.object_index);
+        if (bone >= bone_count) {
+            continue;
+        }
+        for (int v = 0; v < surface.vertex_count; ++v) {
+            const std::size_t vi = static_cast<std::size_t>(surface.first_vertex_index) + v;
+            if (vi < vertex_bone.size()) {
+                vertex_bone[vi] = static_cast<int>(bone);
+            }
+        }
+    }
+
+    bool first = true;
+    for (std::size_t vi = 0; vi < mesh.vertices.size(); ++vi) {
+        const int bone = vertex_bone[vi];
+        if (bone < 0) {
+            continue;
+        }
+        const D3DMATRIX& m = world[static_cast<std::size_t>(bone)];
+        auto& vert = mesh.vertices[vi];
+        // Column-vector transform v' = M*v (translation in the last column _14/_24/_34).
+        const float x = vert.x, y = vert.y, z = vert.z;
+        const float px = m._11 * x + m._12 * y + m._13 * z + m._14;
+        const float py = m._21 * x + m._22 * y + m._23 * z + m._24;
+        const float pz = m._31 * x + m._32 * y + m._33 * z + m._34;
+        const float nx = vert.nx, ny = vert.ny, nz = vert.nz;
+        const float pnx = m._11 * nx + m._12 * ny + m._13 * nz;
+        const float pny = m._21 * nx + m._22 * ny + m._23 * nz;
+        const float pnz = m._31 * nx + m._32 * ny + m._33 * nz;
+        // Model space already stands vertically (feet near the root origin, head up at -Y) —
+        // the .mbd placement (yaw + position) orients it in the world. No extra rotation/flip.
+        vert.x = px; vert.y = py; vert.z = pz;
+        vert.nx = pnx; vert.ny = pny; vert.nz = pnz;
+        // Recompute bounds over the posed vertices.
+        if (first) {
+            mesh.bounds.min_x = mesh.bounds.max_x = vert.x;
+            mesh.bounds.min_y = mesh.bounds.max_y = vert.y;
+            mesh.bounds.min_z = mesh.bounds.max_z = vert.z;
+            first = false;
+        } else {
+            mesh.bounds.min_x = (std::min)(mesh.bounds.min_x, vert.x);
+            mesh.bounds.max_x = (std::max)(mesh.bounds.max_x, vert.x);
+            mesh.bounds.min_y = (std::min)(mesh.bounds.min_y, vert.y);
+            mesh.bounds.max_y = (std::max)(mesh.bounds.max_y, vert.y);
+            mesh.bounds.min_z = (std::min)(mesh.bounds.min_z, vert.z);
+            mesh.bounds.max_z = (std::max)(mesh.bounds.max_z, vert.z);
+        }
+    }
+    return true;
 }
 
 D3DMATRIX transpose_matrix(const D3DMATRIX& m) {
@@ -439,8 +670,12 @@ D3DMATRIX align_up_matrix(Vec3 normal) {
 }
 
 D3DMATRIX placement_matrix(const StaticPlacement& placement) {
+    // The engine's vec14 yaw is the opposite sign to rotation_y_matrix: ControlMove
+    // sets the player's yaw = θ and the body renders correctly as rotation_y_matrix(-θ).
+    // Static objects share that vec14 system, so negate yaw (objects were mirrored in
+    // heading — the staircase looked ~45° off).
     auto matrix = multiply_matrix(
-        multiply_matrix(rotation_y_matrix(placement.yaw), rotation_x_matrix(placement.pitch)),
+        multiply_matrix(rotation_y_matrix(-placement.yaw), rotation_x_matrix(placement.pitch)),
         rotation_z_matrix(placement.roll));
     matrix._41 = placement.x;
     matrix._42 = placement.y;
@@ -699,6 +934,9 @@ struct GameWorldScene::Impl {
     IDirect3DVertexShader9* base_vs = nullptr;
     IDirect3DPixelShader9* base_ps = nullptr;
     IDirect3DPixelShader9* debug_ps = nullptr;  // visualises texcoord (debug_tc.psc)
+    IDirect3DVertexShader9* grass_vs = nullptr;  // wind bend (shaders/custom/grass_wind.vsc)
+    IDirect3DPixelShader9* grass_ps = nullptr;
+    IDirect3DVertexShader9* tree_vs = nullptr;   // foliage wind (shaders/custom/tree_wind.vsc); base PS
     std::unordered_map<std::string, int> base_vs_consts;
     bool world_shaders_ready = false;
     D3DMATRIX view_matrix{};
@@ -713,6 +951,7 @@ struct GameWorldScene::Impl {
     std::vector<StaticPlacement> static_placements;
     std::vector<StaticInstance> static_instances;
     std::vector<GrassInstance> grass_instances;
+    std::vector<GrassRenderBatch> grass_render_batches;  // baked combined grass meshes (per texture)
     std::unordered_map<int, std::vector<std::uint8_t>> grass_maps;
     std::unordered_set<std::uint64_t> grass_cells;
     std::vector<PlayerBatch> player_batches;
@@ -723,6 +962,7 @@ struct GameWorldScene::Impl {
     std::vector<WorldVertex> player_vertex_scratch;
     std::size_t player_action = kPlayerIdleAction;
     float player_anim_time = 0.0f;
+    float npc_anim_time = 0.0f;  // drives the skinned-NPC idle animation
     int player_head_bone = -1;
     bool player_eye_valid = false;
     bool player_eye_initialized = false;
@@ -785,6 +1025,9 @@ struct GameWorldScene::Impl {
         release_com(base_vs);
         release_com(base_ps);
         release_com(debug_ps);
+        release_com(grass_vs);
+        release_com(grass_ps);
+        release_com(tree_vs);
         release_com(world_decl);
         world_shaders_ready = false;
         for (auto& batch : player_batches) {
@@ -807,6 +1050,11 @@ struct GameWorldScene::Impl {
             release_com(resource->index_buffer);
             release_com(resource->vertex_buffer);
         }
+        for (auto& gb : grass_render_batches) {
+            release_com(gb.index_buffer);
+            release_com(gb.vertex_buffer);
+        }
+        grass_render_batches.clear();
         grass_instances.clear();
         grass_cells.clear();
         grass_maps.clear();
@@ -1140,7 +1388,17 @@ struct GameWorldScene::Impl {
     std::unique_ptr<StaticModelResource> load_static_model_resource(
         const std::string& model_name,
         const std::filesystem::path& model_path) {
-        const auto mesh = sphere::model::load_mdl_mesh(model_path);
+        auto mesh = sphere::model::load_mdl_mesh(model_path);
+        // Skinned models (NPCs/creatures) store bone-local bind verts in a flat "lying"
+        // pose; pose them into their rest stance via the MDL skeleton (else they render as
+        // a limbless body on the ground). Non-skinned props are returned unchanged.
+        const bool will_skin = mesh.info.skin_weight_count != 0 && !mesh.objects.empty() &&
+                               !mesh.transform_keys.empty();
+        sphere::model::MdlMesh bind_copy;
+        if (will_skin) {
+            bind_copy = mesh;  // bone-local bind pose + skeleton, kept for per-frame re-posing
+        }
+        const bool is_skinned = apply_mdl_rest_pose(mesh);  // pose frame 0 into mesh.vertices
         if (mesh.vertices.empty() || mesh.triangles.empty() || mesh.surfaces.empty() || mesh.info.materials.empty()) {
             throw std::runtime_error("static model has no renderable geometry: " + model_path.string());
         }
@@ -1170,6 +1428,9 @@ struct GameWorldScene::Impl {
         // leaves are 0x100 while trunks are 0, solid props like stone/castle are
         // all 0). Colliding against every triangle put invisible walls in leaves.
         std::vector<std::uint16_t> collision_idx;
+        // Mark vertices that belong to foliage triangles (flag 0x100 = leaves/canopy) so
+        // the tree-wind shader sways them; trunk/solid verts stay weight 0.
+        std::vector<char> is_foliage(mesh.vertices.size(), 0);
         for (const auto& surface : mesh.surfaces) {
             if (surface.first_triangle_index < 0 || surface.triangle_count < 0 ||
                 surface.first_vertex_index < 0 || surface.vertex_count < 0) {
@@ -1201,12 +1462,15 @@ struct GameWorldScene::Impl {
                     collision_idx.push_back(ia);
                     collision_idx.push_back(ib);
                     collision_idx.push_back(ic);
+                } else {  // foliage (leaves/canopy) — swayed by the tree-wind shader
+                    is_foliage[ia] = is_foliage[ib] = is_foliage[ic] = 1;
                 }
             }
         }
 
         std::vector<std::uint16_t> indices;
         auto resource = std::make_unique<StaticModelResource>();
+        resource->is_skinned = is_skinned;
         resource->vertex_count = static_cast<UINT>(vertices.size());
         resource->bounds_min = Vec3{mesh.bounds.min_x, mesh.bounds.min_y, mesh.bounds.min_z};
         resource->bounds_max = Vec3{mesh.bounds.max_x, mesh.bounds.max_y, mesh.bounds.max_z};
@@ -1232,6 +1496,79 @@ struct GameWorldScene::Impl {
         resource->collision_indices = std::move(collision_idx);
         if (indices.empty() || resource->batches.empty()) {
             throw std::runtime_error("static model has no material batches: " + model_name);
+        }
+        // Bake the foliage sway weight into detail_u: 0 for trunk/solid verts, and the
+        // normalised height above the model base (world +Y is down → base = bounds_max.y)
+        // for foliage verts, so leaf tips sway most. The tree-wind VS reads this; grass
+        // re-derives its own detail_u in bake_grass so this is harmless for grass models.
+        {
+            const float h = resource->bounds_max.y - resource->bounds_min.y;
+            const float inv_h = h > 1e-4f ? 1.0f / h : 0.0f;
+            for (std::size_t v = 0; v < vertices.size(); ++v) {
+                vertices[v].detail_u = is_foliage[v]
+                    ? std::clamp((resource->bounds_max.y - vertices[v].y) * inv_h, 0.0f, 1.0f)
+                    : 0.0f;
+                vertices[v].detail_v = 0.0f;
+            }
+        }
+        // Keep CPU geometry for grass batching (vertices + the combined index list;
+        // batches index into these via start_index/index_count).
+        resource->cpu_vertices = vertices;
+        resource->cpu_indices = indices;
+
+        // Skinned NPC: keep the bind mesh + the WorldVertex template so the VB can be re-posed
+        // every animation frame (only pos/normal change; uv/colour stay). frame_count = the
+        // most frames available across the animated bones' skin_index blocks.
+        if (is_skinned) {
+            resource->bind_mesh = std::move(bind_copy);
+            resource->world_template = vertices;
+            std::size_t max_frames = 0;
+            bool first_anim = true;
+            for (const auto& obj : resource->bind_mesh.objects) {
+                if (obj.is_animated == 0) {
+                    continue;
+                }
+                const std::size_t key = static_cast<std::size_t>(obj.key_index);
+                const std::size_t avail =
+                    resource->bind_mesh.skin_indices.size() > key
+                        ? resource->bind_mesh.skin_indices.size() - key
+                        : 0;
+                max_frames = first_anim ? avail : (std::min)(max_frames, avail);
+                first_anim = false;
+            }
+            resource->frame_count = max_frames > 1 ? static_cast<int>(max_frames) : 1;
+
+            // Clip table: per-clip frame counts = mesh.actions (skin_weights_0x02); clip C spans
+            // [sum(actions[0..C-1]), +actions[C]) within a bone's key block (verified: actions sum
+            // == block size). <model>.cfg maps names→clip index: FREE=idle, FREE1/2/3=gestures.
+            const auto& counts = resource->bind_mesh.actions;
+            int acc = 0;
+            for (int c : counts) {
+                resource->clip_start.push_back(acc);
+                resource->clip_len.push_back(c);
+                acc += c;
+            }
+            auto valid_clip = [&](int idx) {
+                return idx >= 0 && static_cast<std::size_t>(idx) < counts.size() &&
+                       resource->clip_len[static_cast<std::size_t>(idx)] >= 1 &&
+                       resource->clip_start[static_cast<std::size_t>(idx)] +
+                               resource->clip_len[static_cast<std::size_t>(idx)] <=
+                           resource->frame_count;
+            };
+            sphere::params::Config cfg;
+            if (cfg.load(root_path / "params" / (model_name + ".cfg"))) {
+                const int free_clip = cfg.get_int_or("FREE", -1);
+                if (valid_clip(free_clip)) {
+                    resource->idle_clip = free_clip;
+                }
+                for (const char* key : {"FREE1", "FREE2", "FREE3"}) {
+                    const int g = cfg.get_int_or(key, -1);
+                    if (valid_clip(g)) {
+                        resource->gesture_clips.push_back(g);
+                    }
+                }
+            }
+            resource->cur_clip = resource->idle_clip;
         }
 
         const UINT vertex_bytes = static_cast<UINT>(vertices.size() * sizeof(WorldVertex));
@@ -1291,7 +1628,17 @@ struct GameWorldScene::Impl {
                     key,
                     load_static_model_resource(placement.model_name, model_path)).first;
             }
-            const auto world = placement_matrix(placement);
+            auto world = placement_matrix(placement);
+            // Skinned NPCs are posed with their root (feet) at model-space origin; the .mbd Y
+            // is not their exact ground contact (the original plants them on the terrain), so
+            // snap the placement Y to the terrain surface — otherwise they float slightly.
+            if (it->second->is_skinned) {
+                float ground = 0.0f;
+                Vec3 gnormal{};
+                if (terrain_surface_at(placement.x, placement.z, ground, gnormal)) {
+                    world._42 = ground;
+                }
+            }
             Vec3 bounds_min{
                 std::numeric_limits<float>::max(),
                 std::numeric_limits<float>::max(),
@@ -1364,6 +1711,33 @@ struct GameWorldScene::Impl {
             type = static_cast<std::uint8_t>(type + config.grass_highland_pattern_offset);
         }
         return type;
+    }
+
+    // Ground colour beneath (x,z) from the terrain patch texture (R5G6B5), used to
+    // tint grass like the original (FUN_0046d270 samples the patch .dds for the
+    // grass vertex colour). Returns white (no tint) when no patch/texture covers it.
+    DWORD terrain_color_at(float x, float z) const {
+        for (const auto& inst : instances) {
+            const float lx = x - inst.origin_x;
+            const float lz = z - inst.origin_z;
+            if (lx < 0.0f || lz < 0.0f || lx >= config.tile_size || lz >= config.tile_size) {
+                continue;
+            }
+            const auto* res = inst.resource;
+            if (res->tex_pixels.empty()) {
+                continue;
+            }
+            const int px = std::clamp(static_cast<int>(lx / config.tile_size * static_cast<float>(res->tex_w)),
+                                      0, res->tex_w - 1);
+            const int py = std::clamp(static_cast<int>(lz / config.tile_size * static_cast<float>(res->tex_h)),
+                                      0, res->tex_h - 1);
+            const std::uint16_t p = res->tex_pixels[static_cast<std::size_t>(py) * res->tex_w + px];
+            const int r = ((p >> 11) & 0x1f) * 255 / 31;
+            const int g = ((p >> 5) & 0x3f) * 255 / 63;
+            const int b = (p & 0x1f) * 255 / 31;
+            return D3DCOLOR_ARGB(0xff, r, g, b);
+        }
+        return D3DCOLOR_ARGB(0xff, 0xff, 0xff, 0xff);
     }
 
     void load_visible_grass() {
@@ -1480,6 +1854,7 @@ struct GameWorldScene::Impl {
                             0.65f + unit_random() * 0.35f,
                             cell_x,
                             cell_z,
+                            terrain_color_at(sample_x, sample_z),
                         });
                         ++flat_sample_count;
                         flower_type = static_cast<int>(type);
@@ -1522,6 +1897,7 @@ struct GameWorldScene::Impl {
                             0.65f + unit_random() * 0.35f,
                             cell_x,
                             cell_z,
+                            terrain_color_at(detail_x, detail_z),
                         });
                         any_detail = true;
                     }
@@ -1581,11 +1957,13 @@ struct GameWorldScene::Impl {
                             0.65f + flower_unit() * 0.35f,
                             cell_x,
                             cell_z,
+                            terrain_color_at(flower_x, flower_z),
                         });
                     }
                 }
             }
         }
+        bake_grass();  // merge instances into combined per-texture meshes (with tint)
     }
 
     std::unique_ptr<TerrainResource> load_resource(const std::filesystem::path& lnd_path) {
@@ -1657,6 +2035,28 @@ struct GameWorldScene::Impl {
             throw std::runtime_error("required landscape texture is missing: " + texture_path.string());
         }
         resource->texture = load_dds_texture(device, texture_path);
+
+        // Keep a CPU copy of the patch texture (R5G6B5) for grass tinting.
+        try {
+            const auto dds = bin::read_file(texture_path);
+            if (dds.size() >= 128 && dds[0] == 'D' && dds[1] == 'D' && dds[2] == 'S') {
+                const int th = static_cast<int>(bin::u32le(dds, 12));
+                const int tw = static_cast<int>(bin::u32le(dds, 16));
+                const std::uint32_t fourcc = bin::u32le(dds, 84);
+                const std::uint32_t bitcount = bin::u32le(dds, 88);
+                if (fourcc == 0 && bitcount == 16 && tw > 0 && th > 0 &&
+                    dds.size() >= 128 + static_cast<std::size_t>(tw) * th * 2) {
+                    resource->tex_w = tw;
+                    resource->tex_h = th;
+                    resource->tex_pixels.resize(static_cast<std::size_t>(tw) * th);
+                    for (std::size_t i = 0; i < resource->tex_pixels.size(); ++i) {
+                        resource->tex_pixels[i] = bin::u16le(dds, 128 + i * 2);
+                    }
+                }
+            }
+        } catch (...) {
+            // tinting is optional; leave tex_pixels empty on any failure
+        }
 
         const UINT vertex_bytes = static_cast<UINT>(vertices.size() * sizeof(WorldVertex));
         HRESULT hr = device->CreateVertexBuffer(vertex_bytes, 0, kWorldVertexFvf, D3DPOOL_MANAGED, &resource->vertex_buffer, nullptr);
@@ -1850,6 +2250,29 @@ struct GameWorldScene::Impl {
         if (!dbg.empty()) {
             device->CreatePixelShader(reinterpret_cast<const DWORD*>(dbg.data()), &debug_ps);
         }
+
+        // Grass wind shaders (custom, vs_2_0/ps_2_0): bend tufts around their root,
+        // keep the baked ground-colour tint + lighting. Optional — grass falls back
+        // to fixed-function flat lighting if absent.
+        const auto gvs = read_binary_file(root_path / "shaders" / "custom" / "grass_wind.vsc");
+        const auto gps = read_binary_file(root_path / "shaders" / "custom" / "grass_wind.psc");
+        if (!gvs.empty() && !gps.empty()) {
+            if (FAILED(device->CreateVertexShader(reinterpret_cast<const DWORD*>(gvs.data()), &grass_vs)) ||
+                FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(gps.data()), &grass_ps))) {
+                release_com(grass_vs);
+                release_com(grass_ps);
+            }
+        }
+
+        // Tree/foliage wind shader (custom vs_2_0): same constant layout + lighting as the
+        // base VS (so trunks/stones are unchanged) plus a foliage sway driven by the baked
+        // per-vertex weight (detail_u). Reuses the base pixel shader. Optional.
+        const auto tvs = read_binary_file(root_path / "shaders" / "custom" / "tree_wind.vsc");
+        if (!tvs.empty()) {
+            if (FAILED(device->CreateVertexShader(reinterpret_cast<const DWORD*>(tvs.data()), &tree_vs))) {
+                release_com(tree_vs);
+            }
+        }
     }
 
     void set_vs_const(const char* name, const float* data, int vec4_count) {
@@ -1869,6 +2292,23 @@ struct GameWorldScene::Impl {
         set_vs_const("gDirLightColor", colors, 2);
         const float ambient[4] = {
             environment_ambient_red / 255.0f, environment_ambient_green / 255.0f, environment_ambient_blue / 255.0f, 1.0f};
+        set_vs_const("gAmbientColor", ambient, 1);
+    }
+
+    // As above, but modulated by a per-object tint (the ground colour under grass).
+    // The tint is lifted toward white (0.5..1.0) so it shifts hue without over-
+    // darkening — the original colours grass by the terrain beneath it.
+    void set_base_light_constants_tinted(DWORD tint) {
+        const float tr = 0.5f + 0.5f * (((tint >> 16) & 0xff) / 255.0f);
+        const float tg = 0.5f + 0.5f * (((tint >> 8) & 0xff) / 255.0f);
+        const float tb = 0.5f + 0.5f * ((tint & 0xff) / 255.0f);
+        const float colors[8] = {
+            environment_sun_red / 255.0f * tr, environment_sun_green / 255.0f * tg, environment_sun_blue / 255.0f * tb, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f};
+        set_vs_const("gDirLightColor", colors, 2);
+        const float ambient[4] = {
+            environment_ambient_red / 255.0f * tr, environment_ambient_green / 255.0f * tg,
+            environment_ambient_blue / 255.0f * tb, 1.0f};
         set_vs_const("gAmbientColor", ambient, 1);
     }
 
@@ -2420,6 +2860,24 @@ struct GameWorldScene::Impl {
         device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     }
 
+    // The 6 wind-gust circle centres (world XZ), shared by the grass and foliage wind
+    // shaders so both gust together. The native gWindCircle drift has no string anchor
+    // (runtime-generated), so the drift is a reconstructed slow Lissajous wander around the
+    // player; the gust FIELD math + radius/strength constants are exact from vertex/04_00.vsc.
+    void compute_wind_circles(float out[12]) const {
+        static const float rx[6] = {34, 22, 41, 17, 29, 12};
+        static const float rz[6] = {28, 39, 15, 33, 20, 44};
+        static const float sa[6] = {0.13f, 0.19f, 0.11f, 0.23f, 0.16f, 0.27f};
+        static const float sb[6] = {0.17f, 0.09f, 0.21f, 0.14f, 0.25f, 0.12f};
+        static const float pa[6] = {0.0f, 1.1f, 2.3f, 3.7f, 4.9f, 5.5f};
+        static const float pb[6] = {1.7f, 0.4f, 5.1f, 2.8f, 3.3f, 0.9f};
+        const float t = elapsed_seconds;
+        for (int c = 0; c < 6; ++c) {
+            out[c * 2 + 0] = spawn_x + rx[c] * std::sin(t * sa[c] + pa[c]);
+            out[c * 2 + 1] = spawn_z + rz[c] * std::sin(t * sb[c] + pb[c]);
+        }
+    }
+
     void draw_static_objects() {
         device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
         device->SetRenderState(D3DRS_ALPHAREF, 0x20);
@@ -2430,9 +2888,28 @@ struct GameWorldScene::Impl {
         // inside a model to see its interior.
         // Lit + textured via the original base shader pair (verified).
         const bool use_shader = world_shaders_ready;
+        // Foliage wind: reproduces the original's LOOK (gentle directional lean + slow
+        // travelling gusts/«порывы») via the tree-wind VS. The original animates foliage
+        // through the global wind state + procedural textures (not per-vertex), but the
+        // visual result is matched here. Trunk/solid verts (foliage weight 0) don't move.
+        const bool use_wind = use_shader && tree_vs != nullptr;
         if (use_shader) {
             begin_base_shader();
             set_base_light_constants();
+            if (use_wind) {
+                device->SetVertexShader(tree_vs);  // base PS kept; constants share registers
+                const float t = elapsed_seconds;
+                // gWind: x=amplitude, y=time, z=gust speed, w=flutter speed (slow — trees
+                // only sway gently in the original; the real gusts are on the grass).
+                const float params[4] = {config.tree_wind_amplitude, t, config.tree_wind_speed, 0.4f};
+                device->SetVertexShaderConstantF(20, params, 1);
+                // gWindDir: a slowly-turning horizontal wind direction (normalised).
+                const float wa = t * 0.05f;
+                float wd[4] = {std::cos(wa), 0.0f, std::sin(wa), 0.0f};
+                const float wl = std::sqrt(wd[0] * wd[0] + wd[2] * wd[2]);
+                if (wl > 1e-4f) { wd[0] /= wl; wd[2] /= wl; }
+                device->SetVertexShaderConstantF(23, wd, 1);
+            }
         } else {
             device->SetFVF(kWorldVertexFvf);
         }
@@ -2440,6 +2917,10 @@ struct GameWorldScene::Impl {
             const auto* resource = instance.resource;
             if (use_shader) {
                 set_base_world(instance.world);
+                if (use_wind) {
+                    const float objxz[4] = {instance.world._41, instance.world._43, 0.0f, 0.0f};
+                    device->SetVertexShaderConstantF(21, objxz, 1);
+                }
             } else {
                 device->SetTransform(D3DTS_WORLD, &instance.world);
             }
@@ -2462,73 +2943,204 @@ struct GameWorldScene::Impl {
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     }
 
+    // Bake the generated grass instances into a few combined world-space meshes
+    // (grouped by texture), like the original merging a cell's grass into one mesh.
+    // Thousands of tufts then cost a handful of draw calls (per-instance drawing
+    // can't sustain the original's dense 2.0-unit grass grid).
+    void bake_grass() {
+        for (auto& gb : grass_render_batches) {
+            release_com(gb.index_buffer);
+            release_com(gb.vertex_buffer);
+        }
+        grass_render_batches.clear();
+        if (grass_instances.empty() || !device) {
+            return;
+        }
+        struct Accum {
+            std::vector<WorldVertex> verts;
+            std::vector<std::uint32_t> idx;
+        };
+        std::unordered_map<IDirect3DTexture9*, Accum> by_tex;
+        for (const auto& inst : grass_instances) {
+            const auto* res = inst.resource;
+            if (res->cpu_vertices.empty()) {
+                continue;
+            }
+            const D3DMATRIX& w = inst.world;
+            // Bend weight per vertex = normalised height above the tuft root (world
+            // +Y is down → root = bounds_max.y, tip = bounds_min.y). 0 at the root
+            // (planted), 1 at the tip (sways most). Baked into detail_u for the wind VS.
+            const float model_h = res->bounds_max.y - res->bounds_min.y;
+            const float inv_h = model_h > 1e-4f ? 1.0f / model_h : 0.0f;
+            // World Y of the tuft root (model base = bounds_max.y, world +Y down). Used
+            // by the grass VS to grow blades from the ground (distance grow-in).
+            const float root_world_y = res->bounds_max.y * w._22 + w._42;
+            for (const auto& batch : res->batches) {
+                Accum& acc = by_tex[batch.texture];
+                const auto base = static_cast<std::uint32_t>(acc.verts.size());
+                for (const auto& src : res->cpu_vertices) {
+                    WorldVertex v = src;
+                    v.detail_u = std::clamp((res->bounds_max.y - src.y) * inv_h, 0.0f, 1.0f);
+                    v.detail_v = root_world_y;
+                    v.x = src.x * w._11 + src.y * w._21 + src.z * w._31 + w._41;
+                    v.y = src.x * w._12 + src.y * w._22 + src.z * w._32 + w._42;
+                    v.z = src.x * w._13 + src.y * w._23 + src.z * w._33 + w._43;
+                    v.nx = src.nx * w._11 + src.ny * w._21 + src.nz * w._31;
+                    v.ny = src.nx * w._12 + src.ny * w._22 + src.nz * w._32;
+                    v.nz = src.nx * w._13 + src.ny * w._23 + src.nz * w._33;
+                    v.diffuse = inst.tint;  // ground-colour tint baked per vertex
+                    acc.verts.push_back(v);
+                }
+                const UINT end = batch.start_index + batch.index_count;
+                for (UINT i = batch.start_index; i < end && i < res->cpu_indices.size(); ++i) {
+                    acc.idx.push_back(base + res->cpu_indices[i]);
+                }
+            }
+        }
+        for (auto& [texture, acc] : by_tex) {
+            if (acc.verts.empty() || acc.idx.empty()) {
+                continue;
+            }
+            GrassRenderBatch gb;
+            gb.texture = texture;
+            gb.vertex_count = static_cast<UINT>(acc.verts.size());
+            gb.index_count = static_cast<UINT>(acc.idx.size());
+            const UINT vbytes = gb.vertex_count * static_cast<UINT>(sizeof(WorldVertex));
+            const UINT ibytes = gb.index_count * static_cast<UINT>(sizeof(std::uint32_t));
+            if (FAILED(device->CreateVertexBuffer(vbytes, 0, kWorldVertexFvf, D3DPOOL_MANAGED,
+                                                  &gb.vertex_buffer, nullptr))) {
+                continue;
+            }
+            void* p = nullptr;
+            if (SUCCEEDED(gb.vertex_buffer->Lock(0, vbytes, &p, 0))) {
+                std::memcpy(p, acc.verts.data(), vbytes);
+                gb.vertex_buffer->Unlock();
+            }
+            if (FAILED(device->CreateIndexBuffer(ibytes, 0, D3DFMT_INDEX32, D3DPOOL_MANAGED,
+                                                 &gb.index_buffer, nullptr))) {
+                release_com(gb.vertex_buffer);
+                continue;
+            }
+            if (SUCCEEDED(gb.index_buffer->Lock(0, ibytes, &p, 0))) {
+                std::memcpy(p, acc.idx.data(), ibytes);
+                gb.index_buffer->Unlock();
+            }
+            grass_render_batches.push_back(gb);
+        }
+    }
+
     void draw_grass() {
+        if (grass_render_batches.empty()) {
+            return;
+        }
+        // Pre-baked combined grass meshes (world space). A handful of draws sustains
+        // the dense 2.0-unit grid. The grass vertex shader bends tufts around their
+        // root by a travelling gust (VS04 mechanism), keeping the baked ground-colour
+        // tint + lighting; fixed-function (flat tint + sun) is the fallback.
         device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
         device->SetRenderState(D3DRS_ALPHAREF, 0x20);
         device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-        // Lit + textured via the base shader (consistent with terrain/objects).
-        // The wind is still the CPU coherent-wave approximation applied to each
-        // instance's world matrix below; the original's per-vertex shader wind
-        // (VS 04_0x with gWindCircle/gMiniSinTable) needs grass geometry carrying
-        // per-vertex wind attributes (pivot/bend/phase/length), a separate task.
-        const bool use_shader = world_shaders_ready;
-        if (use_shader) {
-            begin_base_shader();
-            set_base_light_constants();
-        } else {
-            device->SetFVF(kWorldVertexFvf);
-        }
-        for (const auto& instance : grass_instances) {
-            const auto* resource = instance.resource;
-            auto world = instance.world;
-            const float x = world._41;
-            const float y = world._42;
-            const float z = world._43;
-            world._41 = 0.0f;
-            world._42 = 0.0f;
-            world._43 = 0.0f;
-            if (config.grass_quality == 2) {
-                // Coherent wind: a wave travels across the field along a fixed
-                // wind direction so neighbouring grass bends together in gusts
-                // (approximating the original's vertex-shader wind) instead of
-                // every blade shimmering at an independent random phase.
-                constexpr float kWindDirX = 0.70f;
-                constexpr float kWindDirZ = 0.71f;
-                constexpr float kSpatialFreq = 0.06f;  // radians per world unit
-                const float spatial = (x * kWindDirX + z * kWindDirZ) * kSpatialFreq;
-                const float t = elapsed_seconds * config.grass_wind_speed;
-                // Slow gust envelope so the wind swells and calms over the field.
-                const float gust = 0.55f + 0.45f * std::sin(t * 0.21f + spatial * 0.5f);
-                const float sway =
-                    std::sin(t - spatial + instance.wind_phase * 0.12f) *
-                    config.grass_wind_amplitude * instance.wind_scale * gust;
-                world = multiply_matrix(world, rotation_z_matrix(sway));
+
+        if (grass_vs && grass_ps && world_decl) {
+            device->SetVertexDeclaration(world_decl);
+            device->SetVertexShader(grass_vs);
+            device->SetPixelShader(grass_ps);
+            const D3DMATRIX wvp = transpose_matrix(view_projection_matrix);  // grass baked in world space
+            device->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(&wvp), 4);
+            const float sundir[4] = {0.40452f, 0.86683f, -0.52009f, 0.0f};  // world toLight
+            device->SetVertexShaderConstantF(4, sundir, 1);
+            // .w of sun = colour gain, .w of ambient = self-illum floor (grass "glow":
+            // its own bright rig keeps it luminous regardless of the dim sun).
+            const float suncol[4] = {environment_sun_red / 255.0f, environment_sun_green / 255.0f,
+                                     environment_sun_blue / 255.0f, config.grass_color_gain};
+            device->SetVertexShaderConstantF(5, suncol, 1);
+            const float amb[4] = {environment_ambient_red / 255.0f, environment_ambient_green / 255.0f,
+                                  environment_ambient_blue / 255.0f, config.grass_glow};
+            device->SetVertexShaderConstantF(6, amb, 1);
+            // wind: gust wave dir (0.71,0.70) * spatial freq 0.06; time phase; amplitude
+            const float wind[4] = {0.0426f, 0.0420f, elapsed_seconds * config.grass_wind_speed,
+                                   config.grass_wind_amplitude};
+            device->SetVertexShaderConstantF(7, wind, 1);
+            // Distance grow/dissolve band: grass grows from the ground + alpha-fades in
+            // between fade_start and fade_end (just inside the generation radius), so new
+            // cells appear/recede smoothly instead of popping (FUN_00477020 grow + LOD).
+            const float cam[4] = {camera_eye.x, camera_eye.y, camera_eye.z, config.grass_fade_start};
+            device->SetVertexShaderConstantF(8, cam, 1);
+            const float fade[4] = {config.grass_fade_end, 0.0f, 0.0f, 0.0f};
+            device->SetVertexShaderConstantF(9, fade, 1);
+            // WindCircle gusts: 6 drifting circle centres (world XZ, packed 2 per register
+            // into c10-c12). The grass shader presses tufts hard inside a circle (native VS04
+            // field math), so gusts read as a circle sweeping across the field — calm
+            // elsewhere. gCtrl.xy = slowly-turning lean direction, .z = circle radius scale
+            // (0.2 native = radius ~5u), .w = calm breeze amount.
+            float circles[12];
+            compute_wind_circles(circles);
+            device->SetVertexShaderConstantF(10, circles, 3);
+            const float wa = elapsed_seconds * 0.05f;
+            const float ctrl[4] = {std::cos(wa), std::sin(wa), config.grass_gust_radius_scale,
+                                   config.grass_breeze};
+            device->SetVertexShaderConstantF(13, ctrl, 1);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            for (const auto& gb : grass_render_batches) {
+                device->SetTexture(0, gb.texture);
+                device->SetStreamSource(0, gb.vertex_buffer, 0, sizeof(WorldVertex));
+                device->SetIndices(gb.index_buffer);
+                device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, gb.vertex_count, 0, gb.index_count / 3);
             }
-            world._41 = x;
-            world._42 = y;
-            world._43 = z;
-            if (use_shader) {
-                set_base_world(world);
-            } else {
-                device->SetTransform(D3DTS_WORLD, &world);
-            }
-            device->SetStreamSource(0, resource->vertex_buffer, 0, sizeof(WorldVertex));
-            device->SetIndices(resource->index_buffer);
-            for (const auto& batch : resource->batches) {
-                device->SetTexture(0, batch.texture);
-                device->DrawIndexedPrimitive(
-                    D3DPT_TRIANGLELIST,
-                    0,
-                    0,
-                    resource->vertex_count,
-                    batch.start_index,
-                    batch.index_count / 3);
-            }
+            device->SetVertexShader(nullptr);
+            device->SetPixelShader(nullptr);
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            configure_render_state();
+            return;
         }
-        if (use_shader) {
-            end_base_shader();
+
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(kWorldVertexFvf);
+
+        D3DMATERIAL9 mat{};
+        mat.Diffuse.r = mat.Diffuse.g = mat.Diffuse.b = mat.Diffuse.a = 1.0f;
+        mat.Ambient = mat.Diffuse;
+        device->SetMaterial(&mat);
+        device->SetRenderState(D3DRS_LIGHTING, TRUE);
+        device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetRenderState(D3DRS_AMBIENT,
+            D3DCOLOR_XRGB(environment_ambient_red, environment_ambient_green, environment_ambient_blue));
+        D3DLIGHT9 light{};
+        light.Type = D3DLIGHT_DIRECTIONAL;
+        light.Diffuse.r = environment_sun_red / 255.0f;
+        light.Diffuse.g = environment_sun_green / 255.0f;
+        light.Diffuse.b = environment_sun_blue / 255.0f;
+        light.Diffuse.a = 1.0f;
+        light.Direction.x = -0.40452f;  // -(world toLight 0.40452,0.86683,-0.52009)
+        light.Direction.y = -0.86683f;
+        light.Direction.z = 0.52009f;
+        device->SetLight(0, &light);
+        device->LightEnable(0, TRUE);
+
+        const auto id = identity_matrix();
+        device->SetTransform(D3DTS_WORLD, &id);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        for (const auto& gb : grass_render_batches) {
+            device->SetTexture(0, gb.texture);
+            device->SetStreamSource(0, gb.vertex_buffer, 0, sizeof(WorldVertex));
+            device->SetIndices(gb.index_buffer);
+            device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, gb.vertex_count, 0, gb.index_count / 3);
         }
+        device->LightEnable(0, FALSE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        configure_render_state();  // restore the shared (shader-era) render state
     }
 
     void draw_sky() {
@@ -2679,13 +3291,17 @@ struct GameWorldScene::Impl {
                       D3DCOLOR_XRGB(environment_clear_red, environment_clear_green, environment_clear_blue),
                       1.0f, 0);
 
-        // Mirror the camera across y = water_y (world +Y is down, so the up vector
-        // flips from -Y to +Y).
-        const Vec3 eye{camera_eye.x, 2.0f * water_y - camera_eye.y, camera_eye.z};
-        const Vec3 target{camera_target.x, 2.0f * water_y - camera_target.y, camera_target.z};
+        // Reflect the WORLD across the water plane y = water_y, then view it with the
+        // normal camera: reflected_view = reflectY · normalView. Reflecting eye/target
+        // + look_at instead would flip the X axis too (horizontal mirror), making the
+        // reflection sweep the wrong way as the camera turns. reflectY flips only Y
+        // (v.y → 2*water_y - v.y); winding is handled by CULL_NONE below.
         const D3DMATRIX saved_view = view_matrix;
         const D3DMATRIX saved_vp = view_projection_matrix;
-        const auto view = look_at_rh_matrix(eye, target, Vec3{0.0f, 1.0f, 0.0f});
+        D3DMATRIX reflect = identity_matrix();
+        reflect._22 = -1.0f;
+        reflect._42 = 2.0f * water_y;
+        const auto view = multiply_matrix(reflect, saved_view);
         view_matrix = view;
         view_projection_matrix = multiply_matrix(view, projection_matrix);
         device->SetTransform(D3DTS_VIEW, &view);
@@ -2713,13 +3329,13 @@ struct GameWorldScene::Impl {
     // (sin(phase)+amp)*scale + baseY, phase from world XZ (continuous across patches)
     // + time. Locks the patch water VB and uploads the displaced positions.
     void update_water_waves(TerrainResource* resource, float origin_x, float origin_z) {
-        if (!resource->water_vertex_buffer || resource->water_cpu_verts.empty() ||
-            config.wave_scale <= 0.0f) {
+        if (!resource->water_vertex_buffer || resource->water_cpu_verts.empty()) {
             return;
         }
         const float kx = config.wave_freq_x / config.wave_cell_step;
         const float kz = config.wave_freq_z / config.wave_cell_step;
         const float time_phase = elapsed_seconds * config.wave_speed;
+        const bool waves = config.wave_scale > 0.0f;
         void* p = nullptr;
         if (FAILED(resource->water_vertex_buffer->Lock(0, 0, &p, 0))) {
             return;
@@ -2727,8 +3343,43 @@ struct GameWorldScene::Impl {
         auto* out = static_cast<WorldVertex*>(p);
         for (std::size_t i = 0; i < resource->water_cpu_verts.size(); ++i) {
             WorldVertex v = resource->water_cpu_verts[i];
-            const float phase = (origin_x + v.x) * kx + (origin_z + v.z) * kz + time_phase;
-            v.y = resource->water_height + (std::sin(phase) + config.wave_amp) * config.wave_scale;
+            const float wx = origin_x + v.x;
+            const float wz = origin_z + v.z;
+            if (waves) {
+                const float phase = wx * kx + wz * kz + time_phase;
+                v.y = resource->water_height + (std::sin(phase) + config.wave_amp) * config.wave_scale;
+            }
+            // Per-vertex water colour = Fresnel gradient (matches PS 01_00: water
+            // colour ramps by 1-N·V). Flat water → N = up (0,-1,0); view direction
+            // from eye to the vertex. Steep (looking down) → deep tone (ambient);
+            // grazing (toward the horizon) → sky tone (clear). Both colours are the
+            // data-driven environment colours (Sky.txt), interpolated by Fresnel.
+            const float dx = wx - camera_eye.x;
+            const float dy = v.y - camera_eye.y;
+            const float dz = wz - camera_eye.z;
+            const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float fresnel = (len > 1e-4f) ? std::clamp(1.0f - std::abs(dy / len), 0.0f, 1.0f) : 0.0f;
+            // Reflection screen-UV computed explicitly on the CPU (the surface point's
+            // own screen position under the NORMAL camera; the RT holds the mirrored
+            // scene at those pixels). Avoids the FF TCI_CAMERASPACEPOSITION path, which
+            // was making the reflection appear to rotate with the camera. Stored in
+            // u/v (perspective divide per-vertex — fine for the small water cells).
+            const D3DMATRIX& m = view_projection_matrix;
+            const float cx = wx * m._11 + v.y * m._21 + wz * m._31 + m._41;
+            const float cy = wx * m._12 + v.y * m._22 + wz * m._32 + m._42;
+            const float cw = wx * m._14 + v.y * m._24 + wz * m._34 + m._44;
+            if (std::abs(cw) > 1e-4f) {
+                v.u = 0.5f + 0.5f * cx / cw;
+                v.v = 0.5f - 0.5f * cy / cw;
+            }
+            auto mix = [fresnel](int deep, int graze) {
+                return static_cast<int>(static_cast<float>(deep) +
+                                        (static_cast<float>(graze - deep)) * fresnel + 0.5f);
+            };
+            v.diffuse = D3DCOLOR_ARGB(0xFF,
+                                      mix(config.water_deep_r, config.water_graze_r),
+                                      mix(config.water_deep_g, config.water_graze_g),
+                                      mix(config.water_deep_b, config.water_graze_b));
             out[i] = v;
         }
         resource->water_vertex_buffer->Unlock();
@@ -2768,42 +3419,32 @@ struct GameWorldScene::Impl {
         const bool use_reflection =
             config.water_reflection_enabled != 0 && reflection_texture != nullptr;
         if (use_reflection) {
-            // Project the planar-reflection RT onto the surface: texcoord = the
-            // surface point's own screen position (the RT holds the mirrored scene
-            // at those same screen pixels). texMtx maps view-space pos → clip → [0,1].
-            const D3DMATRIX bias = {
-                0.5f,  0.0f,  0.0f, 0.0f,
-                0.0f, -0.5f,  0.0f, 0.0f,
-                0.0f,  0.0f,  1.0f, 0.0f,
-                0.5f,  0.5f,  0.0f, 1.0f,
-            };
-            const D3DMATRIX tex_mtx = multiply_matrix(projection_matrix, bias);
-            device->SetTransform(D3DTS_TEXTURE0, &tex_mtx);
+            // Project the planar-reflection RT onto the surface using the per-vertex
+            // screen UV computed in update_water_waves (CPU). Plain texcoord 0, no
+            // texture matrix — keeps the reflection anchored to the world as the
+            // camera turns (the TCI_CAMERASPACEPOSITION path rotated with the camera).
             device->SetTexture(0, reflection_texture);
-            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED);
+            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
             device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
             device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-            // Blend reflection ↔ the water's own colour by the time-of-day reflect
-            // coefficient (decoded FUN_004db5e0): result = k*reflection + (1-k)*base.
-            // Base colour = the environment sky/clear colour (data-driven, Sky.txt) —
-            // a stand-in for the native Fresnel gradient until step 4 (the shader).
+            // Blend reflection ↔ the water's own Fresnel-gradient colour (the per-
+            // vertex DIFFUSE set in update_water_waves) by the time-of-day reflect
+            // coefficient (decoded FUN_004db5e0): result = k*reflection + (1-k)*colour.
+            // k = 0 in full day → pure gradient colour; rises toward dusk/night.
             const int k = std::clamp(static_cast<int>(water_reflect_coeff() * 255.0f + 0.5f), 0, 255);
-            device->SetTextureStageState(0, D3DTSS_CONSTANT,
-                D3DCOLOR_ARGB(k, environment_clear_red, environment_clear_green, environment_clear_blue));
+            device->SetTextureStageState(0, D3DTSS_CONSTANT, D3DCOLOR_ARGB(k, 0, 0, 0));  // k in alpha
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_LERP);
             device->SetTextureStageState(0, D3DTSS_COLORARG0, D3DTA_CONSTANT | D3DTA_ALPHAREPLICATE);  // k
             device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);                          // reflection
-            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CONSTANT);                         // base water colour
+            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);                          // Fresnel gradient
             device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
             device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);  // constant translucency
             device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
         } else {
-            device->SetTexture(0, water_texture);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            // No reflection (REFLQUAL 0): water = its Fresnel-gradient colour only.
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
             device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
             device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);  // constant translucency
             device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
@@ -3084,6 +3725,69 @@ struct GameWorldScene::Impl {
         }
     }
 
+    // Re-pose skinned NPCs per the original _char FreeAn logic: loop the idle (FREE) clip and
+    // occasionally play a random gesture (FREE1/2/3) once, then return to idle. All instances of
+    // a model animate in sync (shared VB) — independent per-NPC state is a later refinement.
+    void update_npc_animation(float delta_seconds) {
+        const float dt = (std::max)(0.0f, delta_seconds);
+        npc_anim_time += dt;
+        const float fps = 12.5f;  // 80 ms/frame, matching the original character anim rate
+        for (auto& entry : static_resources) {
+            StaticModelResource* res = entry.second.get();
+            if (!res || !res->is_skinned || res->idle_clip < 0 || res->world_template.empty() ||
+                !res->vertex_buffer) {
+                continue;
+            }
+            if (res->cur_clip < 0) {
+                res->cur_clip = res->idle_clip;
+            }
+            res->clip_time += dt;
+            const bool is_idle = res->cur_clip == res->idle_clip;
+            const int clip_len = res->clip_len[static_cast<std::size_t>(res->cur_clip)];
+            int frame_in_clip = static_cast<int>(res->clip_time * fps);
+            if (is_idle) {
+                // Loop the idle; occasionally kick off a random gesture (~0.3/sec, like FreeAn).
+                frame_in_clip = clip_len > 0 ? frame_in_clip % clip_len : 0;
+                if (!res->gesture_clips.empty() &&
+                    static_cast<float>(std::rand()) / RAND_MAX < 0.3f * dt) {
+                    res->cur_clip = res->gesture_clips[static_cast<std::size_t>(
+                        std::rand() % static_cast<int>(res->gesture_clips.size()))];
+                    res->clip_time = 0.0f;
+                    frame_in_clip = 0;
+                }
+            } else if (frame_in_clip >= clip_len) {
+                // Gesture finished — return to idle.
+                res->cur_clip = res->idle_clip;
+                res->clip_time = 0.0f;
+                frame_in_clip = 0;
+            }
+            const int frame = res->clip_start[static_cast<std::size_t>(res->cur_clip)] + frame_in_clip;
+            if (frame == res->last_anim_frame) {
+                continue;  // VB already holds this frame
+            }
+            res->last_anim_frame = frame;
+            sphere::model::MdlMesh posed = res->bind_mesh;  // copy bind, then pose this frame
+            if (!apply_mdl_rest_pose(posed, frame)) {
+                continue;
+            }
+            const std::size_t n = (std::min)(res->world_template.size(), posed.vertices.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                res->world_template[i].x = posed.vertices[i].x;
+                res->world_template[i].y = posed.vertices[i].y;
+                res->world_template[i].z = posed.vertices[i].z;
+                res->world_template[i].nx = posed.vertices[i].nx;
+                res->world_template[i].ny = posed.vertices[i].ny;
+                res->world_template[i].nz = posed.vertices[i].nz;
+            }
+            const UINT bytes = static_cast<UINT>(res->world_template.size() * sizeof(WorldVertex));
+            void* dst = nullptr;
+            if (SUCCEEDED(res->vertex_buffer->Lock(0, bytes, &dst, 0))) {
+                std::memcpy(dst, res->world_template.data(), bytes);
+                res->vertex_buffer->Unlock();
+            }
+        }
+    }
+
     bool update(float delta_seconds, const GameMovementInput& input, std::wstring& error) {
         if (!initialized) {
             error = L"game world scene is not initialized";
@@ -3096,6 +3800,7 @@ struct GameWorldScene::Impl {
         const float input_length = std::sqrt(forward * forward + right * right);
         const bool moving = input_length > 0.0001f && delta_seconds > 0.0f;
         update_player_animation(delta_seconds, moving, input.run);
+        update_npc_animation(delta_seconds);
         update_vertical(delta_seconds);
 
         // ControlMove keeps the own character and camera facing the same way.

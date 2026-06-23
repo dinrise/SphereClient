@@ -91,8 +91,15 @@ M.grassmap_world_sign_z = -1
 M.grass_highland_min_y = 300.0
 M.grass_highland_max_y = 800.0
 M.grass_highland_pattern_offset = 15
-M.grass_radius = 42.0
-M.grass_spacing = 8.3333
+-- Native grass extent = a FIXED 13x13 cell grid (DAT_04e2e2bc=0xd, set in FUN_00468bd0;
+-- NOT quality-dependent). Cells span the player ±6 at spacing 8.333 → ~±50 units to the
+-- grid edge, grass reaching ~57 with the sub-offsets — so grass draws FAR with a subtle
+-- edge dissolve (matches the original).
+M.grass_radius = 44.0
+-- Native grass cell step = _DAT_005043a8 = 8.3333 (=100/12). It is a DOUBLE in the exe;
+-- an earlier pass misread the low 4 bytes as a float 2.0, which made grass ~16x too dense
+-- AND shrank the 13x13 grid extent 4x. 8.333 → sparser/natural grass + ~±50u draw range.
+M.grass_spacing = 8.33333
 M.grass_detail_models = {"grass_s00", "grass_s01", "grass_s02", "grass_s03"}
 -- Recovered from DAT_00521488/DAT_00521498, sampled by FUN_0047a150.
 M.grass_sample_offsets = {
@@ -109,9 +116,36 @@ M.grass_scale_max = 1.1
 M.grass_flatness_radius = 2.45
 M.grass_flatness_threshold = 0.5
 M.grass_flatness_normal_y = 0.75
-M.grass_generation_margin = 16.0
-M.grass_wind_amplitude = 0.018
+M.grass_generation_margin = 10.0  -- generate slightly past the fade so cells exist before they fade in
+-- WindCircle gusts (exact native VS04 field): 6 circles drift across the map; grass is
+-- pressed hard ONLY inside a circle (a gust "круг" sweeping the field), calm elsewhere.
+M.grass_wind_amplitude = 1.8        -- gust PRESS strength inside a circle (world units at the tips)
+M.grass_breeze = 0.30               -- calm ever-present sway outside the circles (≈ old gentle look)
+M.grass_gust_radius_scale = 0.12    -- 1/radius: 0.2≈radius 5u (native), 0.12≈radius 8u (one cell, more visible)
 M.grass_wind_speed = 1.35
+-- Tree/foliage sway (tree_wind VS, applied to MDL flag-0x100 leaf/canopy verts; trunks
+-- stay put). The native gWindCircle sim isn't statically extractable, so this is the same
+-- reconstructed travelling gust as grass. Amplitude = leaf-tip sway in world units.
+-- 1.0 = the NATIVE amplitude: vertex/04_00.vsc already bakes the real magnitudes (0.12,
+-- 0.108), so this multiplier must stay 1.0 (anything more is invented and looks like the
+-- whole tree trembling). Foliage motion in the original is deliberately subtle.
+-- Native foliage bend strength _DAT_00502b08 (double) = ~0.01 → vertices move only ~1%
+-- toward the wind ref, i.e. tree foliage barely moves in the original. Keep it tiny.
+M.tree_wind_amplitude = 0.10  -- near-static (original trees change only ~3% of pixels)
+M.tree_wind_speed = 0.35      -- slow swell speed for trees
+-- Grass colour follows TIME OF DAY (verified vs original: grass darkens at night).
+-- The original brightens the per-cell colour through per-channel LUTs (FUN_0047a150
+-- +0x134) so grass reads a bit brighter than raw terrain (the LUTs are runtime-built,
+-- reconstructed here as a colour gain); it is then lit by the scene like everything
+-- else, so a near-zero self-illum floor keeps the day↔night variation (an earlier
+-- 0.72 floor over-glowed it into a flat bright wall and hid the depth between blades).
+M.grass_glow = 0.06        -- minimal floor (just avoids pure black); lets time-of-day drive brightness
+M.grass_color_gain = 1.8   -- brighten the base colour (LUT effect) so night grass stays visibly green
+-- Distance grow/dissolve (FUN_00477020): grass grows out of the ground + alpha-fades in
+-- between these distances. Both sit INSIDE the generation radius (grass_radius 42 +
+-- generation_margin 16 = 58) so cells exist before they need to fade in → no popping.
+M.grass_fade_start = 42.0  -- full height/opaque well out toward the grid edge (subtle, far fade)
+M.grass_fade_end = 54.0    -- by ~54 units (grid edge + sub-offsets): collapsed to ground + invisible
 M.terrain_microtexture = "landscape/bs_.mtx"
 -- Sky.txt t00, active through the original weather manager.
 M.sky_texture = "landscape/clouds.dds"
@@ -246,6 +280,10 @@ M.wave_freq_z = 2.02      -- _DAT_00504048
 M.wave_cell_step = 8.33   -- _DAT_00504038 (tile_size/12)
 M.wave_speed = 1.5        -- orig DAT_04eb9cd0*pi/16; counter rate not extracted → tunable
 M.water_reflection_enabled = 1  -- set 0 to disable planar reflection (flat time-coloured water only)
+-- Water body colour (Fresnel gradient: deep = looking down, graze = toward horizon),
+-- matched to the original's turquoise lake. Tune to taste.
+M.water_deep_r = 30;  M.water_deep_g = 95;  M.water_deep_b = 105
+M.water_graze_r = 70; M.water_graze_g = 150; M.water_graze_b = 165
 M.position_send_interval_ms = 100
 -- ControlMove explicitly calls view_set_z(1, 0.2).
 M.near_clip = 0.2

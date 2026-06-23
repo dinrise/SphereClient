@@ -166,11 +166,30 @@ void read_transform_keys(MdlMesh& mesh, const bin::ByteBuffer& data) {
         key.x = bin::f32le(data, offset + 0x00);
         key.y = bin::f32le(data, offset + 0x04);
         key.z = bin::f32le(data, offset + 0x08);
+        // Quaternion order is (w,x,y,z): the .mdl skeleton path FUN_00454ff0 feeds these to
+        // FUN_0044bb80 with param[0]=w (verified live via the debugger — the quat at the call
+        // site reads w first, and the resulting bone matrices match the running original).
         key.qw = bin::f32le(data, offset + 0x0c);
         key.qx = bin::f32le(data, offset + 0x10);
         key.qy = bin::f32le(data, offset + 0x14);
         key.qz = bin::f32le(data, offset + 0x18);
         mesh.transform_keys.push_back(key);
+    }
+}
+
+void read_skin_indices(MdlMesh& mesh, const bin::ByteBuffer& data) {
+    const auto* section = find_section_by_name(mesh.info, "skin_indices_0x03");
+    if (!section) {
+        return;
+    }
+    bin::require_range(data, section->offset, section->size, "MDL skin indices");
+    mesh.skin_indices.reserve(section->count);
+    for (std::size_t i = 0; i < section->count; ++i) {
+        const std::size_t offset = section->offset + i * section->stride;
+        MdlSkinIndex entry;
+        entry.record = bin::u16le(data, offset + 0x00);
+        entry.blend = bin::u8(data, offset + 0x02);
+        mesh.skin_indices.push_back(entry);
     }
 }
 
@@ -283,6 +302,7 @@ MdlMesh load_mdl_mesh(const std::filesystem::path& path) {
     read_objects(mesh, data);
     read_object_indices(mesh, data);
     read_transform_keys(mesh, data);
+    read_skin_indices(mesh, data);
     read_actions(mesh, data);
     mesh.bounds = compute_bounds(mesh.vertices);
     return mesh;
